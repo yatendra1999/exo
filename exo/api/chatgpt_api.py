@@ -208,6 +208,22 @@ class ChatGPTAPI:
         tokenizer = await resolve_tokenizer(shard.model_id)
         if DEBUG >= 4: print(f"Resolved tokenizer: {tokenizer}")
 
+        # Add system prompt with topology context
+        topology = self.node.current_topology
+        system_message = {
+            "role": "system",
+            "content": f"""
+            You are an AI assistant running on a distributed system called exo. The current topology of the system is:
+            {len(topology.nodes)} nodes:
+            {'\n'.join([f'{d.model} {d.memory_gb()}GB, {d.flops.fp16}TFLOPS (fp16)' for d in topology.nodes.values()])}
+            Total memory: {topology.total_memory_gb()}GB.
+            Total TFLOPS: {topology.total_tflops_fp16()}TFLOPS (fp16).
+            Please consider this information when processing requests.
+            Keep to once sentence responses, concise and friendly for a conversational voice output.
+            """
+        }
+        chat_request.messages.insert(0, system_message)
+
         prompt = build_prompt(tokenizer, chat_request.messages)
         callback_id = f"chatgpt-api-wait-response-{request_id}"
         callback = self.node.on_token.register(callback_id)

@@ -32,6 +32,9 @@ class DeviceCapabilities:
         if isinstance(self.flops, dict):
             self.flops = DeviceFlops(**self.flops)
 
+    def memory_gb(self) -> float:
+        return round(self.memory / 1024, 2)
+
     def to_dict(self):
         return {
             'model': self.model,

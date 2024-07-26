@@ -35,6 +35,15 @@ class Topology:
                     edges.append((node, neighbor))
         return edges
 
+    def total_memory(self) -> int:
+        return sum([node.memory for node in self.nodes.values()])
+
+    def total_memory_gb(self) -> int:
+        return self.total_memory() / 1024
+
+    def total_tflops_fp16(self) -> float:
+        return round(sum([node.flops.fp16 for node in self.nodes.values()]), 2)
+
     def merge(self, other: 'Topology'):
         for node_id, capabilities in other.nodes.items():
             self.update_node(node_id, capabilities)
