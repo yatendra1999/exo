@@ -10,8 +10,6 @@ install_requires = [
   "blobfile==2.1.1",
   "grpcio==1.64.1",
   "grpcio-tools==1.64.1",
-  "hf-transfer==0.1.8",
-  "huggingface-hub==0.24.5",
   "Jinja2==3.1.4",
   "netifaces==0.11.0",
   "numpy==2.0.0",
@@ -24,9 +22,9 @@ install_requires = [
   "rich==13.7.1",
   "safetensors==0.4.3",
   "tenacity==9.0.0",
+  "textract==1.6.5",
   "tiktoken==0.7.0",
   "tokenizers==0.19.1",
-  "tqdm==4.66.4",
   "transformers==4.43.3",
   "uuid==1.30",
   "tinygrad @ git+https://github.com/tinygrad/tinygrad.git@639af3f823cf242a1945dc24183e52a9df0af2b7",
@@ -35,8 +33,8 @@ install_requires = [
 # Add macOS-specific packages if on Darwin (macOS)
 if sys.platform.startswith("darwin"):
   install_requires.extend([
-    "mlx==0.17.1",
-    "mlx-lm==0.17.0",
+    "mlx==0.17.2",
+    "mlx-lm==0.18.1",
   ])
 
 extras_require = {

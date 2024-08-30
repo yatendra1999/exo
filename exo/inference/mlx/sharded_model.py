@@ -4,7 +4,7 @@ from collections import OrderedDict
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import KVCache, RotatingKVCache
-from mlx_lm.sample_utils import top_p_sampling
+from mlx_lm.sample_utils import top_p_sampling, min_p_sampling, categorical_sampling
 
 from ..shard import Shard
 
@@ -24,7 +24,10 @@ class StatefulShardedModel:
     pixel_values=None,
     temp: float = 0.0,
     top_p: float = 1.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 0,
     logit_bias: Optional[Dict[int, float]] = None,
+    prefill_step_size: int = 512,
   ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     def sample(logits: mx.array) -> Tuple[mx.array, float]:
       if logit_bias:
@@ -37,8 +40,10 @@ class StatefulShardedModel:
       else:
         if top_p > 0 and top_p < 1.0:
           token = top_p_sampling(logits, top_p, temp)
+        elif min_p != 0.0:
+          token = min_p_sampling(logits, min_p, min_tokens_to_keep, temp)
         else:
-          token = mx.random.categorical(logits*(1/temp))
+          token = categorical_sampling(logits, temp)
 
       return token
 
@@ -52,6 +57,12 @@ class StatefulShardedModel:
     cache = self.caches[request_id]
 
     if pixel_values is None:
+      if self.shard.is_first_layer():
+        while y.size > prefill_step_size:
+          self.model(y[:prefill_step_size][None], cache=cache)
+          mx.eval([c.state for c in cache])
+          y = y[prefill_step_size:]
+
       output = self.model(y[None] if self.shard.is_first_layer() else y, cache=cache)
     else:
       output = self.model(y, pixel_values=pixel_values, cache=cache)
