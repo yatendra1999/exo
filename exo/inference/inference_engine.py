@@ -16,11 +16,11 @@ class InferenceEngine(ABC):
     pass
 
 
-def get_inference_engine(inference_engine_name: str, shard_downloader: 'ShardDownloader'):
+def get_inference_engine(inference_engine_name: str, shard_downloader: 'ShardDownloader', max_kv_size: int = 1024):
   if inference_engine_name == "mlx":
     from exo.inference.mlx.sharded_inference_engine import MLXDynamicShardInferenceEngine
 
-    return MLXDynamicShardInferenceEngine(shard_downloader)
+    return MLXDynamicShardInferenceEngine(shard_downloader, max_kv_size=max_kv_size)
   elif inference_engine_name == "tinygrad":
     from exo.inference.tinygrad.inference import TinygradDynamicShardInferenceEngine
     import tinygrad.helpers

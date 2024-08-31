@@ -9,9 +9,10 @@ from exo.download.shard_download import ShardDownloader
 
 
 class MLXDynamicShardInferenceEngine(InferenceEngine):
-  def __init__(self, shard_downloader: ShardDownloader):
+  def __init__(self, shard_downloader: ShardDownloader, max_kv_size: int = 1024):
     self.shard = None
     self.shard_downloader = shard_downloader
+    self.max_kv_size = max_kv_size
 
   async def infer_prompt(self, request_id: str, shard: Shard, prompt: str, image_str: Optional[str] = None, inference_state: Optional[str] = None) -> (np.ndarray, str, bool):
     await self.ensure_shard(shard)
@@ -36,5 +37,5 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
 
     model_path = await self.shard_downloader.ensure_shard(shard)
     model_shard, self.tokenizer = await load_shard(model_path, shard)
-    self.stateful_sharded_model = StatefulShardedModel(shard, model_shard)
+    self.stateful_sharded_model = StatefulShardedModel(shard, model_shard, max_kv_size=self.max_kv_size)
     self.shard = shard
