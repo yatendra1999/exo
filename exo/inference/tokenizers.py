@@ -53,7 +53,7 @@ async def _resolve_tokenizer(model_id_or_local_path: Union[str, PathLike]):
     if DEBUG >= 4: print(f"Trying AutoTokenizer for {model_id_or_local_path}")
     return AutoTokenizer.from_pretrained(model_id_or_local_path, trust_remote_code=True)
   except Exception as e:
-    if DEBUG >= 4: print(f"Failed to load tokenizer for {model_id_or_local_path}. Falling back to tinygrad tokenizer. Error: {e}")
+    if DEBUG >= 4: print(f"Failed to load tokenizer for {model_id_or_local_path}. Error: {e}")
     if DEBUG >= 4: print(traceback.format_exc())
 
   raise ValueError(f"[TODO] Unsupported model: {model_id_or_local_path}")

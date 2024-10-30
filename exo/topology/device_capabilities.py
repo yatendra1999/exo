@@ -142,8 +142,6 @@ CHIP_FLOPS.update({f"{key} Laptop GPU": value for key, value in CHIP_FLOPS.items
 def device_capabilities() -> DeviceCapabilities:
   if psutil.MACOS:
     return mac_device_capabilities()
-  elif psutil.LINUX:
-    return linux_device_capabilities()
   else:
     return DeviceCapabilities(
       model="Unknown Device",
@@ -171,42 +169,3 @@ def mac_device_capabilities() -> DeviceCapabilities:
 
   # Assuming static values for other attributes for demonstration
   return DeviceCapabilities(model=model_id, chip=chip_id, memory=memory, flops=CHIP_FLOPS.get(chip_id, DeviceFlops(fp32=0, fp16=0, int8=0)))
-
-
-def linux_device_capabilities() -> DeviceCapabilities:
-  import psutil
-  from tinygrad import Device
-
-  if DEBUG >= 2: print(f"tinygrad {Device.DEFAULT=}")
-  if Device.DEFAULT == "CUDA" or Device.DEFAULT == "NV" or Device.DEFAULT == "GPU":
-    import pynvml
-
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    gpu_raw_name = pynvml.nvmlDeviceGetName(handle).upper()
-    gpu_name = gpu_raw_name.rsplit(" ", 1)[0] if gpu_raw_name.endswith("GB") else gpu_raw_name
-    gpu_memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-
-    if DEBUG >= 2: print(f"NVIDIA device {gpu_name=} {gpu_memory_info=}")
-
-    return DeviceCapabilities(
-      model=f"Linux Box ({gpu_name})",
-      chip=gpu_name,
-      memory=gpu_memory_info.total // 2**20,
-      flops=CHIP_FLOPS.get(gpu_name, DeviceFlops(fp32=0, fp16=0, int8=0)),
-    )
-  elif Device.DEFAULT == "AMD":
-    # TODO AMD support
-    return DeviceCapabilities(
-      model="Linux Box (AMD)",
-      chip="Unknown AMD",
-      memory=psutil.virtual_memory().total // 2**20,
-      flops=DeviceFlops(fp32=0, fp16=0, int8=0),
-    )
-  else:
-    return DeviceCapabilities(
-      model=f"Linux Box (Device: {Device.DEFAULT})",
-      chip=f"Unknown Chip (Device: {Device.DEFAULT})",
-      memory=psutil.virtual_memory().total // 2**20,
-      flops=DeviceFlops(fp32=0, fp16=0, int8=0),
-    )
