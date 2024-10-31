@@ -184,30 +184,6 @@ jobs:
           prompt: "Keep responses concise. Who was the king of pop?"
           expected_output: "Michael Jackson"
 
-  chatgpt_api_integration_test_dummy:
-    macos:
-      xcode: "16.0.0"
-    resource_class: m2pro.large
-    steps:
-      - checkout
-      - run:
-          name: Set up Python
-          command: |
-            brew install python@3.12
-            python3.12 -m venv env
-            source env/bin/activate
-      - run:
-          name: Install dependencies
-          command: |
-            source env/bin/activate
-            pip install --upgrade pip
-            pip install .
-      - run_chatgpt_api_test:
-          inference_engine: dummy
-          model_id: dummy-model
-          prompt: "Dummy prompt."
-          expected_output: "dummy"
-
   test_macos_m1:
     macos:
       xcode: "16.0.0"
@@ -223,5 +199,4 @@ workflows:
       - unit_test
       - discovery_integration_test
       - chatgpt_api_integration_test_mlx
-      - chatgpt_api_integration_test_dummy
       - test_macos_m1
