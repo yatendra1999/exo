@@ -207,7 +207,7 @@ class Transformer:
     h = x
 
     if cache is None:
-      cache = [None for _ in range(self.shard.start_layer, self.shard.end_layer + 1)]  
+      cache = [None for _ in range(self.shard.start_layer, self.shard.end_layer + 1)]
     for i, c in zip(range(self.shard.start_layer, self.shard.end_layer + 1), cache):
       layer = self.layers[i]
       h = layer(h, start_pos, freqs_cis, mask, cache=c)
