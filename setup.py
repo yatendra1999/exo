@@ -27,6 +27,9 @@ install_requires = [
   "transformers==4.46.3",
   "uuid==1.30",
   "tinygrad @ git+https://github.com/tinygrad/tinygrad.git@232edcfd4f8b388807c64fb1817a7668ce27cbad",
+  "flax==0.10.2",
+  "treescope==0.1.6",
+  "torch==2.5.1"
 ]
 
 extras_require = {
