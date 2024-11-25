@@ -30,6 +30,10 @@ from transformers.utils import (
 from transformers.utils.hub import get_checkpoint_shard_files
 from transformers.utils.import_utils import is_safetensors_available
 
+from transformers import logging
+
+logging.set_verbosity_debug()
+
 class ShardedFlaxLlama(FlaxLlamaForCausalLM):
 
     @classmethod
@@ -102,6 +106,8 @@ class ShardedFlaxLlama(FlaxLlamaForCausalLM):
             )
         else:
             model_kwargs = kwargs.copy()
+        
+        return config, os.path.join(pretrained_model_name_or_path, SAFE_WEIGHTS_NAME)
 
         if commit_hash is None:
             commit_hash = getattr(config, "_commit_hash", None)
@@ -502,6 +508,47 @@ class ShardedFlaxLlama(FlaxLlamaForCausalLM):
             return model
         else:
             return model, unflatten_dict(state)
+        
+# model_config = ShardedFlaxLlama.from_pretrained("neuralmagic/Llama-3.2-1B-Instruct-FP8")
 
-pretrained = ShardedFlaxLlama.from_pretrained("neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic")
-print(pretrained.config)
+# model_test = FlaxLlamaForCausalLMModule(model_config)
+
+
+# from jax.random import PRNGKey
+# rng_key = PRNGKey(0)
+# model_test.init(rng_key)
+
+# print("Model Loaded")
+
+
+# from transformers.models.llama import LlamaForCausalLM
+# pretrained = LlamaForCausalLM.from_pretrained("unsloth/Llama-3.2-1B-Instruct")
+# print("Model Loaded")
+# print(pretrained.config)
+
+
+
+if __name__ == "__main__":
+    import numpy as np
+    from torch import from_numpy
+
+    np_rng = np.random.default_rng()
+
+
+    ####### Pytorch Model #########
+    from exo.inference.jax_xla.models.torch_test import torch_config as config, torch_mlp_layer, torch_mlp_weights
+
+
+    ####### Flax Model ########
+    from exo.inference.jax_xla.models.llama import LLamaMLP as FlaxMLP
+    from flax import nnx
+    jrng = nnx.Rngs(0)
+    flax_weights = {key : jnp.array(torch_mlp_weights[key]) for key in torch_mlp_weights}
+    flax_model = FlaxMLP(config, flax_weights, jrng)
+
+    test_input = np_rng.random(2048)
+
+    flax_out = np.array(flax_model(test_input))
+    torch_out = torch_mlp_layer(from_numpy(test_input).float()).detach().numpy()
+    print(np.array_equiv(flax_out, torch_out))
+    print('test for matching output')

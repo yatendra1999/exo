@@ -1,5 +1,7 @@
 {
     "cSpell.words": [
+        "dtypes",
+        "keepdims",
         "ndarray",
         "safetensor"
     ]
