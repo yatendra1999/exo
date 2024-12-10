@@ -28,7 +28,7 @@ class InferenceEngine(ABC):
     tokens = await self.encode(shard, prompt)
     x = tokens.reshape(1, -1)
     output_data = await self.infer_tensor(request_id, shard, x)
-    return output_data 
+    return output_data
 
 inference_engine_classes = {
   "mlx": "MLXDynamicShardInferenceEngine",
@@ -52,7 +52,7 @@ def get_inference_engine(inference_engine_name: str, shard_downloader: 'ShardDow
     return TinygradDynamicShardInferenceEngine(shard_downloader)
   
   elif inference_engine_name == "jax":
-    from jax_xla import JAXShardedInferenceEngine
+    from exo.inference.jax_xla import JAXShardedInferenceEngine
 
     return JAXShardedInferenceEngine(shard_downloader)
   elif inference_engine_name == "dummy":

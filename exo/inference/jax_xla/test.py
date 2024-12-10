@@ -528,7 +528,7 @@ class ShardedFlaxLlama(FlaxLlamaForCausalLM):
 
 
 
-if __name__ == "__main__":
+def test_main():
     import numpy as np
     from torch import from_numpy
 
@@ -536,19 +536,33 @@ if __name__ == "__main__":
 
 
     ####### Pytorch Model #########
-    from exo.inference.jax_xla.models.torch_test import torch_config as config, torch_mlp_layer, torch_mlp_weights
+    from exo.inference.jax_xla.models.torch_test import full_model as torch_model_full, torch_config as config, torch_attention_layer, torch_attention_weights, torch_model_layer_1
 
 
     ####### Flax Model ########
-    from exo.inference.jax_xla.models.llama import LLamaMLP as FlaxMLP
+    from exo.inference.jax_xla.models.llama import LlamaAttention as FlaxAttention, LlamaDecoderLayer as Decoder
     from flax import nnx
     jrng = nnx.Rngs(0)
-    flax_weights = {key : jnp.array(torch_mlp_weights[key]) for key in torch_mlp_weights}
-    flax_model = FlaxMLP(config, flax_weights, jrng)
+    flax_weights = {key : jnp.array(torch_attention_weights[key]) for key in torch_attention_weights}
+    flax_model = FlaxAttention(config, flax_weights, jrng)
 
-    test_input = np_rng.random(2048)
+    test_input = np_rng.random((1, 12, 2048))
 
+    # test_2 = torch_model_full(from_numpy(test_input).int())
+    torch_test_out = torch_model_layer_1(from_numpy(test_input).float())
+
+    torch_out = torch_attention_layer(from_numpy(test_input).float()).detach().numpy()
     flax_out = np.array(flax_model(test_input))
-    torch_out = torch_mlp_layer(from_numpy(test_input).float()).detach().numpy()
     print(np.array_equiv(flax_out, torch_out))
     print('test for matching output')
+
+def test_main2():
+    from exo.inference.jax_xla.models.llama import LlamaAttention as FlaxAttention, LlamaDecoderLayer as Decoder
+
+    from exo.inference.jax_xla.models.torch_test import full_model as torch_model_full, torch_config as config, torch_model_layer_1
+
+    test = Decoder.from_torch(config, torch_model_layer_1)
+    print("LOL")
+
+if __name__ == "__main__":
+    test_main2()

@@ -1,9 +1,18 @@
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
 from transformers.models.llama.modeling_flax_llama import *
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer as TorchLlamaDecoderLayer
+from transformers.utils import SAFE_WEIGHTS_NAME, cached_file
 from jax import numpy as jnp
 import jax
+import torch
 from flax import nnx
 from flax.nnx import make_causal_mask, combine_masks
+from exo.inference.shard import Shard
+from exo.download.shard_download import ShardDownloader
+from safetensors import safe_open
+from .base import FlaxBaseModule, FlaxLlmModel
 
 
 ACT_MAP: dict[str, callable] = {
@@ -61,7 +70,7 @@ class VariableCache(nnx.Variable):
     pass
 
 # Define nnx-based Llama Attention
-class LlamaAttention(nnx.Module):
+class LlamaAttention(FlaxBaseModule):
     def __init__(self, config: LlamaConfig, weights: dict[str,jax.Array], rngs: nnx.rnglib.Rngs, dtype=jnp.float32, causal=True, is_cross_attention=False):
         self.config = config
         self.dtype = dtype
@@ -93,6 +102,19 @@ class LlamaAttention(nnx.Module):
             "cached_value": jnp.zeros,
             "cache_index": lambda: jnp.array(0, dtype=jnp.int32)
         })
+
+    @classmethod
+    def from_safetensor(cls, config, key: str, path: str, framework: str):
+        rngs = nnx.Rngs(0)
+        with safe_open(path, framework=framework) as st:
+            weights = {
+                'q': cls.convert_from_pt(st.get_tensor(f"{key}.q_proj.weight")),
+                'k': cls.convert_from_pt(st.get_tensor(f"{key}.k_proj.weight")),
+                'v': cls.convert_from_pt(st.get_tensor(f"{key}.v_proj.weight")),
+                'o': cls.convert_from_pt(st.get_tensor(f"{key}.o_proj.weight"))
+            }
+        return cls(config=config, rngs=rngs, weights=weights)
+        
 
     def _split_heads(self, hidden_states, num_heads):
         return hidden_states.reshape(hidden_states.shape[:2] + (num_heads, -1))
@@ -190,7 +212,7 @@ class LlamaAttention(nnx.Module):
             attention_mask = combine_masks(pad_mask, attention_mask)
         return key, value, attention_mask
     
-class LlamaRMSNorm(nnx.Module):
+class LlamaRMSNorm(FlaxBaseModule):
 
     def __init__(self, config: LlamaConfig, weights: jax.Array):
         self.weights = nnx.Param(weights)
@@ -205,8 +227,15 @@ class LlamaRMSNorm(nnx.Module):
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
 
         return self.weights * jnp.asarray(hidden_states, dtype=self.dtype)
+    
+    @classmethod
+    def from_safetensor(cls, config, key, path, framework):
+        with safe_open(path, framework=framework) as st:
+            weights = st.get_tensor(f"{key}.weight")
+        weights = cls.convert_from_pt(weights)
+        return cls(config, weights)
 
-class LlamaMLP(nnx.Module):
+class LlamaMLP(FlaxBaseModule):
     
     def __init__(self, config: LlamaConfig, weights_map: dict[str, jax.Array], rng: nnx.rnglib.Rngs):
         self.up_proj = nnx.Linear(config.intermediate_size, config.hidden_size, use_bias=config.mlp_bias, kernel_init=lambda x,y,z : weights_map['up'], rngs=rng)
@@ -219,18 +248,41 @@ class LlamaMLP(nnx.Module):
         ### Ignoring the values of pretraining_tp > 1. Find more details here: https://huggingface.co/docs/transformers/main/model_doc/llama2#transformers.LlamaConfig.pretraining_tp
     
         return self.down_proj( self.activation_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+    
+    @classmethod
+    def from_safetensor(cls, config, key, path, framework):
+        with safe_open(path, framework=framework) as st:
+            weights = {
+                "up": cls.convert_from_pt(st.get_tensor(f"{key}.up_proj.weight")),
+                "gate": cls.convert_from_pt(st.get_tensor(f"{key}.gate_proj.weight")),
+                "down": cls.convert_from_pt(st.get_tensor(f"{key}.down_proj.weight")),
+            }
+        return cls(config, weights, rng=nnx.Rngs(0))
 
-class LlamaDecoderLayer(nnx.Module):
+class LlamaDecoderLayer(FlaxBaseModule):
 
-    def __init__(self, config: LlamaConfig, weights_map: dict, rngs: nnx.rnglib.Rngs):
+    def __init__(self, config: LlamaConfig, safetensor_path = None, safetensor_key: str = None, weights_map: dict = None, rngs: nnx.rnglib.Rngs = nnx.Rngs(0)):
 
         config.max_position_embeddings = 1024 ## Hardcoded right now for testing and avoiding OOM kills.
 
-        ## Add option to load the tensor weights from the safetensor file and then use those to init the layer component weights
-        self.input_layernorm = LlamaRMSNorm(config, weights_map['input_layernorm'])
-        self.self_attn = LlamaAttention(config, weights_map['self_attn'], rngs)
-        self.post_attention_layernorm = LlamaRMSNorm(config, weights_map['post_attention_layernorm'])
-        self.mlp = LlamaMLP(config, weights_map['mlp'], rngs)
+        if weights_map is not None:
+            if all([x in weights_map for x in ["input_layernorm", "self_attn", "post_attention_layernorm", "mlp"]]):
+                self.input_layernorm = LlamaRMSNorm(config, weights_map['input_layernorm'])
+                self.self_attn = LlamaAttention(config, weights_map['self_attn'], rngs)
+                self.post_attention_layernorm = LlamaRMSNorm(config, weights_map['post_attention_layernorm'])
+                self.mlp = LlamaMLP(config, weights_map['mlp'], rngs)
+                return
+            else:
+                raise Exception("Weights provided do not contain all required layers.")
+        
+        if safetensor_path is None or safetensor_key is None:
+            raise Exception("Both safetensor_path and safetensor_key are required to init layer from safetensors file.")
+
+        self.input_layernorm = LlamaRMSNorm.from_safetensor(config, f"{safetensor_key}.input_layernorm", safetensor_path, framework='pt')
+        self.self_attn = LlamaAttention.from_safetensor(config, f"{safetensor_key}.self_attn", safetensor_path, framework='pt')
+        self.post_attention_layernorm = LlamaRMSNorm.from_safetensor(config, f"{safetensor_key}.post_attention_layernorm", safetensor_path, framework='pt')
+        self.mlp = LlamaMLP.from_safetensor(config, f"{safetensor_key}.mlp", safetensor_path, framework='pt')
+
 
     @classmethod
     def from_torch(cls, config: LlamaConfig, layer: TorchLlamaDecoderLayer):
@@ -255,11 +307,8 @@ class LlamaDecoderLayer(nnx.Module):
         return cls(config, weights_map, rngs)
     
     @classmethod
-    def from_safetensors(cls, file_path: str, layer_idx: int):
-        """
-        TODO : Init the model weights directly from the safetensors file.
-        """
-        pass
+    def from_safetensor(cls, config, key, path, framework, dense = True):
+        return cls(config, safetensor_key = key, safetensor_path = path)
 
     def __call__(
         self,
@@ -291,11 +340,102 @@ class LlamaDecoderLayer(nnx.Module):
         hidden_states = residual + hidden_states
 
         return (hidden_states,) + outputs[1:]
+    
+class LlamaEmbedding(nnx.Embed, FlaxBaseModule):
 
-# if __name__ == "__main__":
-#     from jax import numpy as jnp
-#     def flaxtensor(x):
-#         return jnp.array(x.detach().numpy())
-#     flax_layers = LlamaDecoderLayer.from_torch(self.config, decoder_layer)
-#     flax_out = flax_layers(flaxtensor(hidden_states), attention_mask=causal_mask,
-#                         position_ids=flaxtensor(position_ids))
+    @classmethod
+    def from_safetensor(cls, config, key, path, framework):
+        with safe_open(path, framework=framework) as st:
+            weights = st.get_tensor(f"{key}.weight")
+        weights = cls.convert_from_pt(weights, dense=False)
+        return cls(weights.shape[0], weights.shape[1], embedding_init=lambda x, y, z: weights, rngs=nnx.Rngs(0))
+
+class ShardedLlamaModel(FlaxLlmModel):
+    layers: list[FlaxBaseModule] = []
+    executor: ThreadPoolExecutor
+    config: LlamaConfig | None
+    shard: Shard | None
+    lm_head: nnx.Module
+
+    def __init__(self):
+        self.shard = None
+        self.config = None
+        self.executor = ThreadPoolExecutor(max_workers=1)
+
+    def _load_model(self):
+        if self.shard == None:
+            raise Exception("Model attempted to load from an empty shard.")
+        if self.config == None:
+            raise Exception("Model attempted to load from an empty config.")
+        
+        ## TODO
+        safetensor_path = cached_file("unsloth/Llama-3.2-1B-Instruct", SAFE_WEIGHTS_NAME)
+
+        if self.shard.is_first_layer():
+            embeddings = LlamaEmbedding.from_safetensor(self.config, "model.embed_tokens", safetensor_path, framework="pt")
+            self.layers.append(embeddings)
+            self.lm_head = embeddings.attend
+        
+        for layer_idx in range(self.shard.start_layer, self.shard.end_layer + 1):
+            layer_module = LlamaDecoderLayer.from_safetensor(self.config, f"model.layers.{layer_idx}", safetensor_path, framework="pt")
+            self.layers.append(layer_module)
+
+        if self.shard.is_last_layer():
+            module = LlamaRMSNorm.from_safetensor(self.config, f"model.norm", safetensor_path, framework='pt')
+            self.layers.append(module)
+
+    def load_shard(self, config: LlamaConfig, shard: Shard):
+        if self.shard == shard:
+            return
+        self.shard = shard
+        if hasattr(self, "layers"):
+            self.layers = []
+        self.config = config
+        self._load_model()
+
+    
+    def generate_args(self, input_shape: tuple[int, ...]) -> dict[str, ]:
+        model_args = {
+            # "attention_mask" : jnp.ones(input_shape, dtype=jnp.uint4),
+            "attention_mask" : None,
+            "position_ids" : jnp.expand_dims(jnp.arange(input_shape[-1]), axis=0),
+            "output_attentions" : False,
+        }
+        return model_args
+
+    def __call__(self, hidden_state: jax.Array) -> jax.Array:
+        from exo.tracer import load_from_timestamp
+        model_args = self.generate_args(hidden_state.shape)
+        for layer in self.layers:
+            if isinstance(layer, (nnx.Embed, LlamaRMSNorm)):
+                hidden_state = layer(hidden_state)
+            if isinstance(layer, LlamaDecoderLayer):
+                layer_out = layer(hidden_state, **model_args)
+                hidden_state = layer_out[0]
+        return hidden_state
+
+    def sample_logits(self, hidden_state: np.ndarray) -> np.ndarray:
+        hidden_state = jnp.array(hidden_state)
+        logits = self.lm_head(hidden_state[:, -1:, :]) ## Keep only the logits from last token as only that is required for generation.
+        logits = np.squeeze(logits)
+        probs = nnx.softmax(logits, axis=-1)
+        key = jax.random.PRNGKey(0)
+        next_tokens = jax.random.choice(key, a=jnp.arange(probs.shape[-1]), p=probs, shape=(1,)).squeeze(0)
+        from .test2 import print_decoded
+        print_decoded(next_tokens)
+        return np.array(next_tokens)
+
+if __name__ == "__main__":
+    from transformers.utils import SAFE_WEIGHTS_NAME, cached_file
+    model_id = "unsloth/Llama-3.2-1B-Instruct"
+    resolved_archive_file = cached_file(model_id, SAFE_WEIGHTS_NAME)
+    test_shard = Shard(start_layer = 0, n_layers = 16, end_layer = 15, model_id = model_id)
+    engine = ShardedLlamaModel(None)
+
+    engine.load_shard(test_shard)
+    # engine
+
+    print(engine.layers)
+    # with safe_open(resolved_archive_file, framework='pt') as stf:
+    #     print(stf)
+    #     print(stf.get_tensor())

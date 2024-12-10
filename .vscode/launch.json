@@ -12,6 +12,15 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {"PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2", "JAX_TRACEBACK_FILTERING": "off", "PYDEVD_WARN_EVALUATION_TIMEOUT": "30"}
+        },
+        {
+            "name": "DEBUG: Main",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/exo/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {"PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2", "JAX_TRACEBACK_FILTERING": "off", "PYDEVD_WARN_EVALUATION_TIMEOUT": "30"}
         }
     ]
 }
