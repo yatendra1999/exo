@@ -58,7 +58,8 @@ def get_stack_name(stack: list[FrameInfo]) -> str:
         if 'self' in local_vars:
             obj = local_vars['self']
             class_name = obj.__class__.__name__
-            frame_stack.append(class_name)
+            if not (len(frame_stack) > 0 and class_name == frame_stack[-1]):
+                frame_stack.append(class_name)
     return '.'.join(frame_stack)
 
 def hook_function(fn: callable) -> callable:
