@@ -15,7 +15,13 @@ from exo.inference.shard import Shard
 from exo.download.shard_download import ShardDownloader
 from safetensors import safe_open
 from .base import FlaxBaseModule, FlaxLlmModel
-from .utils import compute_llama3_parameters
+from .utils.rope import compute_llama3_parameters
+from .utils.logits import (
+    TopKLogitProcessor,
+    TopPLogitProcessor,
+    TemperatureLogitProcessor,
+    LogitProcessorList
+)
 from jax.nn import dot_product_attention
 from flax.nnx.module import first_from
 from flax.typing import (
@@ -196,30 +202,30 @@ class LlamaAttention(FlaxBaseModule):
         )
 
         # Handle causal masking
-        query_length, key_length = query.shape[1], key.shape[1]
-        causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+        # query_length, key_length = query.shape[1], key.shape[1]
+        # causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
-        batch_size = hidden_states.shape[0]
-        causal_mask = jnp.broadcast_to(
-            causal_mask, (batch_size,) + causal_mask.shape[1:]
-        )
-        attention_mask = combine_masks(attention_mask, causal_mask)
+        # batch_size = hidden_states.shape[0]
+        # causal_mask = jnp.broadcast_to(
+        #     causal_mask, (batch_size,) + causal_mask.shape[1:]
+        # )
+        # attention_mask = combine_masks(attention_mask, causal_mask)
 
 
         key = jnp.repeat(key, self.num_key_value_groups, axis=2)
         value = jnp.repeat(value, self.num_key_value_groups, axis=2)
 
         # Attention bias
-        if self.config.attention_bias:
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
-                    self.dtype
-                ),
-            )
-        else:
-            attention_bias = None
+        # if self.config.attention_bias:
+        #     attention_bias = lax.select(
+        #         attention_mask > 0,
+        #         jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+        #         jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
+        #             self.dtype
+        #         ),
+        #     )
+        # else:
+        #     attention_bias = None
 
         # Old Attention
         # attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
@@ -238,9 +244,10 @@ class LlamaAttention(FlaxBaseModule):
 
         # # Compute attention outputs
         # attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+        is_causal = True if position_ids.shape[-1] > 1 else False
 
 
-        attn_weights = dot_product_attention(query, key, value, bias=None, is_causal=True, mask=None)
+        attn_weights = dot_product_attention(query, key, value, bias=None, is_causal=is_causal, mask=None)
         attn_output = self._merge_heads(attn_weights)
         attn_output = self.o_proj(attn_output)
 
@@ -489,6 +496,7 @@ class LlamaEmbedding(nnx.Embed, FlaxBaseModule):
 
 class ShardedLlamaModel(FlaxLlmModel):
     layers: list[FlaxBaseModule] = []
+    cache_positions: dict[str, int] = {}
     executor: ThreadPoolExecutor
     config: LlamaConfig | None
     shard: Shard | None
@@ -544,18 +552,24 @@ class ShardedLlamaModel(FlaxLlmModel):
         self.config = config
         self._load_model()
 
-    def generate_args(self, input_shape: tuple[int, ...]) -> dict[str,]:
+    def generate_args(self, request_id: str, input_shape: tuple[int, ...]) -> dict[str,]:
+        if request_id in self.cache_positions:
+            start = self.cache_positions[request_id]
+        else:
+            start = 0
+        end = start + input_shape[-1]
+        self.cache_positions[request_id] = end
         model_args = {
             # "attention_mask" : jnp.ones(input_shape, dtype=jnp.uint4),
             "attention_mask": None,
-            "position_ids": jnp.expand_dims(jnp.arange(input_shape[-1]), axis=0),
+            "position_ids": jnp.expand_dims(jnp.arange(start=start, stop=end), axis=0),
             "output_attentions": False,
         }
         return model_args
 
-    def __call__(self, hidden_state: jax.Array) -> jax.Array:
+    def __call__(self, request_id: str, hidden_state: jax.Array) -> jax.Array:
 
-        model_args = self.generate_args(hidden_state.shape)
+        model_args = self.generate_args(request_id, hidden_state.shape)
         global rotary_embedding
         rotary_embedding.create_embed(model_args['position_ids'])
         for layer in self.layers:
@@ -566,20 +580,19 @@ class ShardedLlamaModel(FlaxLlmModel):
                 hidden_state = layer_out[0]
         return hidden_state
 
-    def sample_logits(self, hidden_state: np.ndarray) -> np.ndarray:
+    def sample_logits(self, hidden_state: np.ndarray, temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9) -> np.ndarray:
+        logits_processor = LogitProcessorList([TemperatureLogitProcessor(temperature), TopKLogitProcessor(top_k), TopPLogitProcessor(top_p)])
         hidden_state = jnp.array(hidden_state)
         logits = self.lm_head(
             hidden_state[:, -1:, :]
         )  ## Keep only the logits from last token as only that is required for generation.
         logits = np.squeeze(logits)
+        logits = logits_processor(logits, [])
         probs = nnx.softmax(logits, axis=-1)
         key = jax.random.PRNGKey(0)
         next_tokens = jax.random.choice(
             key, a=jnp.arange(probs.shape[-1]), p=probs, shape=(1,)
         ).squeeze(0)
-        from .test2 import print_decoded
-
-        print_decoded(next_tokens)
         return np.array(next_tokens)
 
 

@@ -36,5 +36,5 @@ class FlaxLlmModel(nnx.Module):
         pass
 
     @abstractmethod
-    def sample_logits(self, hidden_state: np.ndarray) -> np.ndarray:
+    def sample_logits(self, request_id: str, hidden_state: np.ndarray) -> np.ndarray:
         pass

@@ -47,7 +47,7 @@ class JAXShardedInferenceEngine(InferenceEngine):
     async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray) -> np.ndarray:
         '''Run the model layers on the input array'''
         await self.ensure_shard(shard)
-        return await asyncio.get_running_loop().run_in_executor(self.executor, lambda x : self.module(jnp.array(x)), input_data)
+        return await asyncio.get_running_loop().run_in_executor(self.executor, lambda request_id, x : self.module(request_id, jnp.array(x)), request_id, input_data)
 
     async def ensure_shard(self, shard: Shard) -> None:
         if shard == self.current_shard:
