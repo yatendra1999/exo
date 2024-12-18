@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 from jax import numpy as jnp
+import jax
+from flax import nnx
 
 from exo.inference.shard import Shard
 from exo.inference.tokenizers import resolve_tokenizer
@@ -32,21 +34,25 @@ class JAXShardedInferenceEngine(InferenceEngine):
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
         '''Convert the input string into tokenized array.'''
         await self.ensure_shard(shard)
+        return np.array(self.tokenizer.encode(prompt))
         tokens = await asyncio.get_running_loop().run_in_executor(self.executor, self.tokenizer.encode, prompt)
         return await asyncio.get_running_loop().run_in_executor(self.executor, np.array, tokens)
     
     async def sample(self, x: np.ndarray) -> np.ndarray:
         '''Sample the logits for the next token.'''
+        return self.module.sample_logits(x)
         return await asyncio.get_running_loop().run_in_executor(self.executor, self.module.sample_logits, x)
 
     async def decode(self, shard: Shard, tokens: np.ndarray) -> str:
         '''Convert the model output into actual response string.'''
         await self.ensure_shard(shard)
+        return self.tokenizer.decode(tokens)
         return await asyncio.get_running_loop().run_in_executor(self.executor, self.tokenizer.decode, tokens)
 
     async def infer_tensor(self, request_id: str, shard: Shard, input_data: np.ndarray) -> np.ndarray:
         '''Run the model layers on the input array'''
         await self.ensure_shard(shard)
+        return self.module(request_id, jnp.array(input_data))
         return await asyncio.get_running_loop().run_in_executor(self.executor, lambda request_id, x : self.module(request_id, jnp.array(x)), request_id, input_data)
 
     async def ensure_shard(self, shard: Shard) -> None:

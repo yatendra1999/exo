@@ -126,6 +126,7 @@ class LlamaAttention(FlaxBaseModule):
             config.hidden_size,
             self.num_heads * self.head_dim,
             kernel_init=lambda x, y, z: weights["q"],
+            use_bias=False,
             rngs=rngs,
         )
         self.k_proj = nnx.Linear(
@@ -251,8 +252,7 @@ class LlamaAttention(FlaxBaseModule):
         attn_output = self._merge_heads(attn_weights)
         attn_output = self.o_proj(attn_output)
 
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
-        return outputs
+        return attn_output
 
     # Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoSelfAttention._concatenate_to_cache
     def _concatenate_to_cache(self, key, value, query, attention_mask):
@@ -458,7 +458,7 @@ class LlamaDecoderLayer(FlaxBaseModule):
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        outputs = self.self_attn(
+        attn_output = self.self_attn(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -466,8 +466,6 @@ class LlamaDecoderLayer(FlaxBaseModule):
             init_cache=init_cache,
             output_attentions=output_attentions,
         )
-        # residual connection
-        attn_output = outputs[0]
         hidden_states = residual + attn_output
 
         residual = hidden_states
@@ -476,7 +474,7 @@ class LlamaDecoderLayer(FlaxBaseModule):
         # residual connection
         hidden_states = residual + hidden_states
 
-        return (hidden_states,) + outputs[1:]
+        return hidden_states
 
 
 class LlamaEmbedding(nnx.Embed, FlaxBaseModule):
@@ -495,6 +493,8 @@ class LlamaEmbedding(nnx.Embed, FlaxBaseModule):
 
 
 class ShardedLlamaModel(FlaxLlmModel):
+    embed = None
+    norm = None
     layers: list[FlaxBaseModule] = []
     cache_positions: dict[str, int] = {}
     executor: ThreadPoolExecutor
@@ -525,23 +525,23 @@ class ShardedLlamaModel(FlaxLlmModel):
             embeddings = LlamaEmbedding.from_safetensor(
                 self.config, "model.embed_tokens", safetensor_path, framework="pt"
             )
-            self.layers.append(embeddings)
-            self.lm_head = embeddings.attend
+            self.embed = nnx.jit(embeddings)
+            self.lm_head = nnx.jit(embeddings.attend)
 
         for layer_idx in range(self.shard.start_layer, self.shard.end_layer + 1):
-            layer_module = LlamaDecoderLayer.from_safetensor(
+            layer_module = nnx.jit(LlamaDecoderLayer.from_safetensor(
                 self.config,
                 f"model.layers.{layer_idx}",
                 safetensor_path,
                 framework="pt",
-            )
+            ))
             self.layers.append(layer_module)
 
         if self.shard.is_last_layer():
-            module = LlamaRMSNorm.from_safetensor(
+            module = nnx.jit(LlamaRMSNorm.from_safetensor(
                 self.config, f"model.norm", safetensor_path, framework="pt"
-            )
-            self.layers.append(module)
+            ))
+            self.norm = module
 
     def load_shard(self, config: LlamaConfig, shard: Shard):
         if self.shard == shard:
@@ -567,19 +567,24 @@ class ShardedLlamaModel(FlaxLlmModel):
         }
         return model_args
 
-    def __call__(self, request_id: str, hidden_state: jax.Array) -> jax.Array:
+    @partial(nnx.jit, static_argnames=['request_id'])
+    def __call__(self, request_id: str, hidden_states: jax.Array) -> jax.Array:
 
-        model_args = self.generate_args(request_id, hidden_state.shape)
+        model_args = self.generate_args(request_id, hidden_states.shape)
         global rotary_embedding
         rotary_embedding.create_embed(model_args['position_ids'])
-        for layer in self.layers:
-            if isinstance(layer, (nnx.Embed, LlamaRMSNorm)):
-                hidden_state = layer(hidden_state)
-            if isinstance(layer, LlamaDecoderLayer):
-                layer_out = layer(hidden_state, **model_args)
-                hidden_state = layer_out[0]
-        return hidden_state
 
+        if self.embed != None:
+            hidden_states = self.embed(hidden_states)
+
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, **model_args)
+
+        if self.norm != None:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    @partial(nnx.jit, static_argnames=['temperature', 'top_k', 'top_p'])
     def sample_logits(self, hidden_state: np.ndarray, temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9) -> np.ndarray:
         logits_processor = LogitProcessorList([TemperatureLogitProcessor(temperature), TopKLogitProcessor(top_k), TopPLogitProcessor(top_p)])
         hidden_state = jnp.array(hidden_state)

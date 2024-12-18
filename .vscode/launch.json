@@ -5,13 +5,49 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "DEBUG: Torch",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/exo/inference/jax_xla/models/test2.py",
+            "console": "integratedTerminal",
+            "subProcess": true,
+            "justMyCode": false,
+            "env": {
+                "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2",
+                "JAX_TRACEBACK_FILTERING": "off",
+                "PYDEVD_WARN_EVALUATION_TIMEOUT": "30",
+                "PYTHONPATH": "${workspaceRoot}"
+            }
+        },
+        {
+            "name": "DEBUG: JAX",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/exo/inference/jax_xla/models/test3.py",
+            "console": "integratedTerminal",
+            "subProcess": true,
+            "justMyCode": false,
+            "env": {
+                "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2",
+                "JAX_TRACEBACK_FILTERING": "off",
+                "PYDEVD_WARN_EVALUATION_TIMEOUT": "30",
+                "PYTHONPATH": "${workspaceRoot}"
+            }
+        },
+        {
             "name": "DEBUG: Current",
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
+            "subProcess": true,
             "justMyCode": false,
-            "env": {"PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2", "JAX_TRACEBACK_FILTERING": "off", "PYDEVD_WARN_EVALUATION_TIMEOUT": "30"}
+            "env": {
+                "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2",
+                "JAX_TRACEBACK_FILTERING": "off",
+                "PYDEVD_WARN_EVALUATION_TIMEOUT": "30",
+                "PYTHONPATH": "${workspaceRoot}"
+            }
         },
         {
             "name": "DEBUG: Main",
@@ -20,7 +56,13 @@
             "program": "${workspaceFolder}/exo/main.py",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "env": {"PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2", "JAX_TRACEBACK_FILTERING": "off", "PYDEVD_WARN_EVALUATION_TIMEOUT": "30"}
+            "env": {
+                "DEBUG": "9",
+                "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2",
+                "JAX_TRACEBACK_FILTERING": "off",
+                "PYDEVD_WARN_EVALUATION_TIMEOUT": "30",
+                "PYTHONPATH": "${workspaceRoot}"
+            }
         }
     ]
 }
