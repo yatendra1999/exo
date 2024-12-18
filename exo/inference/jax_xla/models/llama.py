@@ -1,4 +1,3 @@
-import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from transformers.models.llama.modeling_flax_llama import *
@@ -8,11 +7,9 @@ from transformers.models.llama.modeling_llama import (
 from transformers.utils import SAFE_WEIGHTS_NAME, cached_file
 from jax import numpy as jnp
 import jax
-import torch
 from flax import nnx
 from flax.nnx import make_causal_mask, combine_masks
 from exo.inference.shard import Shard
-from exo.download.shard_download import ShardDownloader
 from safetensors import safe_open
 from .base import FlaxBaseModule, FlaxLlmModel
 from .utils.rope import compute_llama3_parameters
@@ -23,21 +20,9 @@ from .utils.logits import (
     LogitProcessorList
 )
 from jax.nn import dot_product_attention
-from flax.nnx.module import first_from
-from flax.typing import (
-    Dtype,
-    Shape,
-    Initializer,
-    PrecisionLike,
-    DotGeneralT,
-)
-from exo.tracer import load_from_timestamp
 
-Array = jax.Array
 
 ACT_MAP: dict[str, callable] = {"silu": nnx.swish}
-
-# Helper functions for attention
 
 
 def create_sinusoidal_positions(num_pos, dim):
@@ -102,8 +87,6 @@ class LlamaAttention(FlaxBaseModule):
         weights: dict[str, jax.Array],
         rngs: nnx.rnglib.Rngs,
         dtype=jnp.float32,
-        causal=True,
-        is_cross_attention=False,
     ):
         self.config = config
         self.dtype = dtype
@@ -125,30 +108,35 @@ class LlamaAttention(FlaxBaseModule):
         self.q_proj = nnx.Linear(
             config.hidden_size,
             self.num_heads * self.head_dim,
-            kernel_init=lambda x, y, z: weights["q"],
             use_bias=False,
             rngs=rngs,
         )
+        self.q_proj.kernel.value = weights['q']
+        
         self.k_proj = nnx.Linear(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
-            kernel_init=lambda x, y, z: weights["k"],
+            use_bias=False,
             rngs=rngs,
         )
+        self.k_proj.kernel.value = weights['k']
+
         self.v_proj = nnx.Linear(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
-            kernel_init=lambda x, y, z: weights["v"],
+            use_bias=False,
             rngs=rngs,
         )
+        self.v_proj.kernel.value = weights["v"]
+
         self.o_proj = nnx.Linear(
             self.num_heads * self.head_dim,
             config.hidden_size,
-            kernel_init=lambda x, y, z: weights["o"],
+            use_bias=False,
             rngs=rngs,
         )
+        self.o_proj.kernel.value = weights["o"]
 
-        # Caching for autoregressive decoding
         self.cache = nnx.State(
             {
                 "cached_key": jnp.zeros,
@@ -180,9 +168,6 @@ class LlamaAttention(FlaxBaseModule):
         hidden_states,
         attention_mask,
         position_ids,
-        deterministic=True,
-        init_cache=False,
-        output_attentions=False,
     ):
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
@@ -202,59 +187,19 @@ class LlamaAttention(FlaxBaseModule):
             key, value, query, attention_mask
         )
 
-        # Handle causal masking
-        # query_length, key_length = query.shape[1], key.shape[1]
-        # causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-
-        # batch_size = hidden_states.shape[0]
-        # causal_mask = jnp.broadcast_to(
-        #     causal_mask, (batch_size,) + causal_mask.shape[1:]
-        # )
-        # attention_mask = combine_masks(attention_mask, causal_mask)
-
-
+        # Broadcast Key and Value to match Query shape
         key = jnp.repeat(key, self.num_key_value_groups, axis=2)
         value = jnp.repeat(value, self.num_key_value_groups, axis=2)
 
-        # Attention bias
-        # if self.config.attention_bias:
-        #     attention_bias = lax.select(
-        #         attention_mask > 0,
-        #         jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-        #         jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
-        #             self.dtype
-        #         ),
-        #     )
-        # else:
-        #     attention_bias = None
-
-        # Old Attention
-        # attention_dtype = jnp.float32 if self.attention_softmax_in_fp32 else self.dtype
-        # attn_weights = dot_product_attention_weights(
-        #     query,
-        #     key,
-        #     bias=attention_bias,
-        #     dropout_rng=None if deterministic else self.make_rng("dropout"),
-        #     dropout_rate=self.config.attention_dropout,
-        #     deterministic=deterministic,
-        #     dtype=attention_dtype,
-        # )
-
-        # if self.attention_softmax_in_fp32:
-        #     attn_weights = attn_weights.astype(self.dtype)
-
-        # # Compute attention outputs
-        # attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
         is_causal = True if position_ids.shape[-1] > 1 else False
 
-
+        # Calculate attention values
         attn_weights = dot_product_attention(query, key, value, bias=None, is_causal=is_causal, mask=None)
         attn_output = self._merge_heads(attn_weights)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
 
-    # Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoSelfAttention._concatenate_to_cache
     def _concatenate_to_cache(self, key, value, query, attention_mask):
         """
         This function takes projected key, value states from a single input token and concatenates the states to cached
@@ -323,23 +268,25 @@ class LlamaMLP(FlaxBaseModule):
             config.intermediate_size,
             config.hidden_size,
             use_bias=config.mlp_bias,
-            kernel_init=lambda x, y, z: weights_map["up"],
             rngs=rng,
         )
+        self.up_proj.kernel.value = weights_map["up"]
+
         self.gate_proj = nnx.Linear(
             config.intermediate_size,
             config.hidden_size,
             use_bias=config.mlp_bias,
-            kernel_init=lambda x, y, z: weights_map["gate"],
             rngs=rng,
         )
+        self.gate_proj.kernel.value = weights_map["gate"]
+
         self.down_proj = nnx.Linear(
             config.hidden_size,
             config.intermediate_size,
             use_bias=config.mlp_bias,
-            kernel_init=lambda x, y, z: weights_map["down"],
             rngs=rng,
         )
+        self.down_proj.kernel.value = weights_map["down"]
         self.activation_fn = ACT_MAP[config.hidden_act]
 
     def __call__(self, hidden_states: jax.Array):
@@ -452,9 +399,6 @@ class LlamaDecoderLayer(FlaxBaseModule):
         hidden_states,
         attention_mask=None,
         position_ids=None,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -462,9 +406,6 @@ class LlamaDecoderLayer(FlaxBaseModule):
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
         )
         hidden_states = residual + attn_output
 
@@ -525,11 +466,11 @@ class ShardedLlamaModel(FlaxLlmModel):
             embeddings = LlamaEmbedding.from_safetensor(
                 self.config, "model.embed_tokens", safetensor_path, framework="pt"
             )
-            self.embed = nnx.jit(embeddings)
-            self.lm_head = nnx.jit(embeddings.attend)
+            self.embed = (embeddings)
+            self.lm_head = (embeddings.attend)
 
         for layer_idx in range(self.shard.start_layer, self.shard.end_layer + 1):
-            layer_module = nnx.jit(LlamaDecoderLayer.from_safetensor(
+            layer_module = (LlamaDecoderLayer.from_safetensor(
                 self.config,
                 f"model.layers.{layer_idx}",
                 safetensor_path,
@@ -538,7 +479,7 @@ class ShardedLlamaModel(FlaxLlmModel):
             self.layers.append(layer_module)
 
         if self.shard.is_last_layer():
-            module = nnx.jit(LlamaRMSNorm.from_safetensor(
+            module = (LlamaRMSNorm.from_safetensor(
                 self.config, f"model.norm", safetensor_path, framework="pt"
             ))
             self.norm = module
@@ -562,12 +503,11 @@ class ShardedLlamaModel(FlaxLlmModel):
         model_args = {
             # "attention_mask" : jnp.ones(input_shape, dtype=jnp.uint4),
             "attention_mask": None,
-            "position_ids": jnp.expand_dims(jnp.arange(start=start, stop=end), axis=0),
-            "output_attentions": False,
+            "position_ids": jnp.expand_dims(jnp.arange(start=start, stop=end), axis=0)
         }
         return model_args
 
-    @partial(nnx.jit, static_argnames=['request_id'])
+    # @partial(nnx.jit, static_argnames=['request_id'])
     def __call__(self, request_id: str, hidden_states: jax.Array) -> jax.Array:
 
         model_args = self.generate_args(request_id, hidden_states.shape)
@@ -584,7 +524,7 @@ class ShardedLlamaModel(FlaxLlmModel):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    @partial(nnx.jit, static_argnames=['temperature', 'top_k', 'top_p'])
+    # @partial(nnx.jit, static_argnames=['temperature', 'top_k', 'top_p'])
     def sample_logits(self, hidden_state: np.ndarray, temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9) -> np.ndarray:
         logits_processor = LogitProcessorList([TemperatureLogitProcessor(temperature), TopKLogitProcessor(top_k), TopPLogitProcessor(top_p)])
         hidden_state = jnp.array(hidden_state)
