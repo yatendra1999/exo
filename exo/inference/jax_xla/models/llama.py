@@ -65,11 +65,12 @@ class LlamaRotaryEmbedding(nnx.Module):
 
         return self.cos, self.sin
 
-    def __call__(self, query, key, expand_axis = 2):
+    def __call__(self, query: jnp.ndarray, key: jnp.ndarray, expand_axis = 2):
         cos = jnp.expand_dims(self.cos, axis=expand_axis)
         sin = jnp.expand_dims(self.sin, axis=expand_axis)
-        query_embed = (query * cos) + (rotate_half(query) * sin)
-        key_embed = (key * cos) + (rotate_half(key) * sin)
+
+        query_embed = ((query * cos) + (rotate_half(query) * sin)).astype(query.dtype)
+        key_embed = ((key * cos) + (rotate_half(key) * sin)).astype(key.dtype)
 
         return query_embed, key_embed
 
@@ -86,7 +87,7 @@ class LlamaAttention(FlaxBaseModule):
         config: LlamaConfig,
         weights: dict[str, jax.Array],
         rngs: nnx.rnglib.Rngs,
-        dtype=jnp.float32,
+        dtype=jax.dtypes.bfloat16,
     ):
         self.config = config
         self.dtype = dtype
@@ -136,14 +137,6 @@ class LlamaAttention(FlaxBaseModule):
             rngs=rngs,
         )
         self.o_proj.kernel.value = weights["o"]
-
-        self.cache = nnx.State(
-            {
-                "cached_key": jnp.zeros,
-                "cached_value": jnp.zeros,
-                "cache_index": lambda: jnp.array(0, dtype=jnp.int32),
-            }
-        )
 
     @classmethod
     def from_safetensor(cls, config, key: str, path: str, framework: str):
@@ -442,6 +435,7 @@ class ShardedLlamaModel(FlaxLlmModel):
     config: LlamaConfig | None
     shard: Shard | None
     lm_head: nnx.Module
+    dtype = jax.dtypes.bfloat16
 
     def __init__(self):
         self.shard = None
@@ -503,13 +497,12 @@ class ShardedLlamaModel(FlaxLlmModel):
         model_args = {
             # "attention_mask" : jnp.ones(input_shape, dtype=jnp.uint4),
             "attention_mask": None,
-            "position_ids": jnp.expand_dims(jnp.arange(start=start, stop=end), axis=0)
+            "position_ids": jnp.expand_dims(jnp.arange(start=start, stop=end, dtype=self.dtype), axis=0)
         }
         return model_args
 
     # @partial(nnx.jit, static_argnames=['request_id'])
     def __call__(self, request_id: str, hidden_states: jax.Array) -> jax.Array:
-
         model_args = self.generate_args(request_id, hidden_states.shape)
         global rotary_embedding
         rotary_embedding.create_embed(model_args['position_ids'])
