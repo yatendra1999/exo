@@ -46,7 +46,7 @@
                 "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2",
                 "JAX_TRACEBACK_FILTERING": "off",
                 "PYDEVD_WARN_EVALUATION_TIMEOUT": "30",
-                "PYTHONPATH": "${workspaceRoot}"
+                "PYTHONPATH": "${workspaceRoot}",
             }
         },
         {
@@ -57,12 +57,17 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "DEBUG": "9",
+                "DEBUG": "2",
                 "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "2",
+                // "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                "JAX_DISABLE_JIT": "1",
                 "JAX_TRACEBACK_FILTERING": "off",
                 "PYDEVD_WARN_EVALUATION_TIMEOUT": "30",
                 "PYTHONPATH": "${workspaceRoot}"
-            }
+            },
+            "args": [
+                "--inference-engine=jax"
+            ]
         }
     ]
 }
