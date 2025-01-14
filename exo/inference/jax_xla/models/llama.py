@@ -190,9 +190,7 @@ class LlamaAttention(FlaxBaseModule):
         query, key = rotary_embedding(query, key)
 
         # Apply caching for autoregressive decoding
-        # key, value, attention_mask = self._concatenate_to_cache(
-        #     key, value, query, attention_mask
-        # )
+        key, value = self._concatenate_to_cache(key, value)
 
         # Broadcast Key and Value to match Query shape
         key = jnp.repeat(key, self.num_key_value_groups, axis=2)
@@ -207,7 +205,7 @@ class LlamaAttention(FlaxBaseModule):
 
         return attn_output
 
-    def _concatenate_to_cache(self, key, value, query, attention_mask):
+    def _concatenate_to_cache(self, key, value):
         """
         This function takes projected key, value states from a single input token and concatenates the states to cached
         states from previous steps. This function is slighly adapted from the official Flax repository:
@@ -220,24 +218,13 @@ class LlamaAttention(FlaxBaseModule):
             self.cached_value = VariableCache(value)
             self.cache_index = VariableCache(key.shape[-3])
         else:
-            *batch_dims, max_length, num_heads, depth_per_head = (
-                self.cached_key.value.shape
-            )
-            cur_index = self.cache_index.value
+            num_updated_cache_vectors = key.shape[-3]
             key = jnp.append(self.cached_key.value, key, axis=-3)
             value = jnp.append(self.cached_value.value, value, axis=-3)
             self.cached_key.value = key
             self.cached_value.value = value
-            num_updated_cache_vectors = query.shape[-3]
             self.cache_index.value = self.cache_index.value + num_updated_cache_vectors
-            # causal mask for cached decoder self-attention: our single query position should only attend to those key positions that have already been generated and cached, not the remaining zero elements.
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-            )
-            attention_mask = combine_masks(pad_mask, attention_mask)
-        return key, value, attention_mask
-
+        return key, value
 
 class LlamaRMSNorm(FlaxBaseModule):
 
