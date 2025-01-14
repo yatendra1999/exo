@@ -654,26 +654,19 @@ def causal_attention(q,k,v):
 def single_token_attention(q,k,v):
     return jit_attention(q,k,v,is_causal=False,implementation="cudnn")
 
-@partial(jax.jit, static_argnames=['num_kv_heads', 'num_attention_heads'], backend="gpu")
-def test_layer(
-        hidden_state: jax.Array,
-        input_layernorm: jax.Array,
-        down_proj: jax.Array,
-        gate_proj: jax.Array,
-        up_proj: jax.Array,
-        post_attention_layernorm: jax.Array,
-        k_proj: jax.Array,
-        o_proj: jax.Array,
-        q_proj: jax.Array,
-        v_proj: jax.Array,
-        sin: jax.Array,
-        cos: jax.Array,
-        epsilon: jax.Array,
-        kv_cache: jax.Array,
-        num_kv_heads: int,
-        num_attention_heads: int,
+@partial(jax.jit, static_argnames=['num_kv_heads', 'num_attention_heads'])
+def pre_cache(
+    hidden_state: jax.Array,
+    input_layernorm: jax.Array,
+    epsilon: jax.Array,
+    q_proj: jax.Array,
+    k_proj: jax.Array,
+    v_proj: jax.Array,
+    sin: jax.Array,
+    cos: jax.Array,
+    num_kv_heads: int,
+    num_attention_heads: int,
 ):
-    # epsilon = epsilon.astype(jax.dtypes.bfloat16)
     hidden_state = jax.lax.convert_element_type(hidden_state, jax.dtypes.bfloat16)
     residual = hidden_state
     hidden_state = rms_norm(hidden_state, input_layernorm, epsilon)
@@ -684,6 +677,59 @@ def test_layer(
     k = _split_kv(k, num_kv_heads)
     v = _split_kv(v, num_kv_heads)
     q,k = apply_rotary_embed(q, k, sin, cos)
+    return q,k,v,residual
+
+@jax.jit
+def post_cache(
+    attn_out: jax.Array,
+    residual: jax.Array,
+    o_proj: jax.Array,
+    post_attention_layernorm: jax.Array,
+    epsilon: jax.Array,
+    down_proj: jax.Array,
+    gate_proj: jax.Array,
+    up_proj: jax.Array,
+):
+    attn_out = _merge_heads(attn_out)
+    attn_out = _linear(attn_out, o_proj)
+    hidden_state = residual + attn_out
+    residual = hidden_state
+    hidden_state = rms_norm(hidden_state, post_attention_layernorm, epsilon)
+    hidden_state = mlp(hidden_state, up_proj, gate_proj, down_proj)
+    return hidden_state + residual
+
+@partial(jax.jit, static_argnames=['num_kv_heads', 'num_attention_heads'])
+def test_layer(
+        hidden_state: jax.Array,
+        input_layernorm: jax.Array,
+        epsilon: jax.Array,
+        q_proj: jax.Array,
+        k_proj: jax.Array,
+        v_proj: jax.Array,
+        sin: jax.Array,
+        cos: jax.Array,
+        kv_cache: jax.Array,
+        o_proj: jax.Array,
+        post_attention_layernorm: jax.Array,
+        down_proj: jax.Array,
+        gate_proj: jax.Array,
+        up_proj: jax.Array,
+        num_kv_heads: int,
+        num_attention_heads: int,
+):
+    # epsilon = epsilon.astype(jax.dtypes.bfloat16)
+    q,k,v,residual = pre_cache(hidden_state,
+        input_layernorm,
+        epsilon,
+        q_proj,
+        k_proj,
+        v_proj,
+        sin,
+        cos,
+        num_kv_heads,
+        num_attention_heads
+    )
+    
 
     ## Use cache
     kv = lax.concatenate(
@@ -695,12 +741,6 @@ def test_layer(
     v = kv_cache[1, ...]
 
     # attn_out = jax.lax.cond(hidden_state.shape[-3] > 1, causal_attention, single_token_attention, q, k, v)
-
-    attn_out = jit_attention(q,k,v, is_causal=True, implementation="cudnn") 
-    attn_out = _merge_heads(attn_out)
-    attn_out = _linear(attn_out, o_proj)
-    hidden_state = residual + attn_out
-    residual = hidden_state
-    hidden_state = rms_norm(hidden_state, post_attention_layernorm, epsilon)
-    hidden_state = mlp(hidden_state, up_proj, gate_proj, down_proj)
-    return (hidden_state + residual, kv_cache)
+    attn_out = jit_attention(q,k,v, is_causal=True, implementation="cudnn")
+    hidden_state = post_cache(attn_out, residual, o_proj, post_attention_layernorm, epsilon, down_proj, gate_proj, up_proj)
+    return (hidden_state, kv_cache)

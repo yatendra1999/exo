@@ -8,8 +8,8 @@ from jax import numpy as jnp
 from jax.nn import dot_product_attention
 from flax import nnx
 from timeit import timeit
-import perfetto
 import time
+
 
 jit_attention = jax.jit(dot_product_attention, static_argnames=['bias', 'mask', 'scale', 'is_causal', 'query_seq_lengths', 'key_value_seq_lengths', 'local_window_size', 'implementation'])
 
@@ -233,28 +233,24 @@ def test_layer_performance():
 
     
     ## Call once for JIT compilation
-    # _, kv_cache = llama_jit(**jit_kwargs)
-    # kv_cache.block_until_ready()
-    # jit_kwargs['kv_cache'] = kv_cache
-    # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=False):
-    #     start = time.time_ns()
-    #     out_jit, kv_cache = llama_jit(**jit_kwargs)
-    #     out_jit.block_until_ready()
-    #     time_jit = time.time_ns() - start
-    #     print(f"JIT Time: {time_jit}")
+    start = time.time_ns()
+    _, kv_cache = llama_jit(**jit_kwargs)
+    kv_cache.block_until_ready()
+    print(f"JIT Base Time: {time.time_ns() - start}")
+    jit_kwargs['kv_cache'] = kv_cache
+    
+    ## Profile Subsequent calls with JIT cache
+    with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=False):
+        start = time.time_ns()
+        out_jit, kv_cache = llama_jit(**jit_kwargs)
+        out_jit.block_until_ready()
+        print(f"JIT Time: {time.time_ns() - start}")
     
     ## Calculate EPS
-    
-    ### Cache miss timings: 
-    # import perfetto
+    calc_eps(out, out_jit[0])
 
 
     # print(f"TIMINGS: BASE {time_base}ns JIT {time_jit}ns")
-    # if(isinstance(out, tuple)):
-    #     for i in range(len(out)):
-    #         calc_eps(out[i],out_jit[i])
-    # else:
-    #     calc_eps(out, out_jit)
     # jit_kwargs['kv_cache'] = kv_cache
     
     # base_time = timeit(f"llama(**kwargs)[0].block_until_ready()", globals=func_globals, number=10)
