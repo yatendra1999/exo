@@ -22,11 +22,42 @@ from .utils.logits import (
 )
 from jax.nn import dot_product_attention
 from jax import lax
+import torch
 jit_attention = jax.jit(dot_product_attention, static_argnames=['bias', 'mask', 'scale', 'is_causal', 'query_seq_lengths', 'key_value_seq_lengths', 'local_window_size', 'implementation'])
 
 
 ACT_MAP: dict[str, callable] = {"silu": nnx.jit(nnx.swish)}
 act_fn_jit = jax.jit(jax.nn.swish)
+
+
+def convert_from_pt(tensor, dense: bool = False):
+    dtype_dict = {
+        torch.bool : jnp.bool,
+        torch.uint8 : jnp.uint8,
+        torch.int8 : jnp.int8,
+        torch.int16 : jnp.int16,
+        torch.int32 : jnp.int32,
+        torch.int64 : jnp.int64,
+        torch.float16 : jnp.float16,
+        torch.float32 : jnp.float32,
+        torch.float64 : jnp.float64,
+        torch.complex64 : jnp.complex64,
+        torch.complex128 : jnp.complex128,
+        torch.bfloat16 : jax.dtypes.bfloat16
+    }
+    orig_dtype = tensor.dtype
+    if orig_dtype == torch.bfloat16:
+        tensor = tensor.float()
+
+    jax_dtype = dtype_dict[orig_dtype]
+    
+    if tensor.dim() < 2:
+        return jnp.array(tensor.detach().numpy(), dtype=jax_dtype)
+
+    if dense: ## Linear(Dense) layers in JAX require weights to be transposed if they are being converted from pytorch.
+        return jnp.array(tensor.detach().numpy().transpose(), dtype=jax_dtype)
+
+    return jnp.array(tensor.detach().numpy(), dtype=jax_dtype)
 
 @jax.jit
 def rotate_half(tensor: jax.Array):
@@ -41,7 +72,20 @@ def rotate_half(tensor: jax.Array):
     )
     return rotate_half_tensor
 
-# @partial(jax.jit, static_argnames=['expand_axis'])
+@jax.jit
+def prep_rotary_embed(tensor: jax.Array, inv_freq: jax.Array, attn_scaling: jax.Array):
+    position_ids = jnp.expand_dims(jnp.arange(start=0, stop=tensor.shape[-1], dtype=jax.dtypes.bfloat16), axis=0)
+    inv_freq_expanded = jnp.expand_dims(inv_freq, (0, 2))
+    position_ids_expanded = jnp.expand_dims(position_ids, (1))
+
+    freq = jnp.matmul(inv_freq_expanded, position_ids_expanded).transpose(0, 2, 1)
+    freq = jnp.append(freq, freq, axis=-1)
+
+    cos = jnp.cos(freq) * attn_scaling
+    sin = jnp.sin(freq) * attn_scaling
+
+    return sin, cos
+
 @jax.jit
 def apply_rotary_embed(query: jax.Array, key: jax.Array, sin: jax.Array, cos: jax.Array):
     orig_dtype = query.dtype
@@ -553,19 +597,26 @@ def _linear(
         ):
     return lax.dot_general(input, weight, (((input.ndim - 1,), (0,)), ((), ())))
 
-@partial(jax.jit, static_argnames=['num_heads'])
+
+# _split_query: callable
+# _split_kv: callable
+
+# def generate_splitter(num_heads: int) -> callable:
+#     func = eval(f"jax.jit(lambda arr : jax.lax.reshape(arr, (*arr.shape[:2], {num_heads}, arr.shape[-1] // {num_heads})))")
+#     return func
+
+
+@partial(nnx.jit, static_argnames=['num_heads'])
 def _split_query(arr: jax.Array, num_heads: int):
     return jax.lax.reshape(arr, (*arr.shape[:2], num_heads, arr.shape[-1] // num_heads))
-    return arr.reshape(*arr.shape[:2], num_heads, -1)
 
-@partial(jax.jit, static_argnames=['num_heads'])
+@partial(nnx.jit, static_argnames=['num_heads'])
 def _split_kv(arr: jax.Array, num_heads: int):
     return jax.lax.reshape(arr, (*arr.shape[:2], num_heads, arr.shape[-1] // num_heads))
-    return arr.reshape(*arr.shape[:2], num_heads, -1)
 
 @jax.jit
 def _merge_heads(hidden_states: jax.Array):
-        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
+    return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
 @jax.jit ## Reduces from 0.4 -> 0.3 but also increases the eps to e-5 from e-6. Revisit.
 def mlp(hidden_states: jax.Array, up_proj: jax.Array, gate_proj: jax.Array, down_proj: jax.Array):
@@ -698,7 +749,7 @@ def post_cache(
     hidden_state = mlp(hidden_state, up_proj, gate_proj, down_proj)
     return hidden_state + residual
 
-@partial(jax.jit, static_argnames=['num_kv_heads', 'num_attention_heads'])
+# @partial(jax.jit, static_argnames=['num_kv_heads', 'num_attention_heads'])
 def test_layer(
         hidden_state: jax.Array,
         input_layernorm: jax.Array,
@@ -744,3 +795,169 @@ def test_layer(
     attn_out = jit_attention(q,k,v, is_causal=True, implementation="cudnn")
     hidden_state = post_cache(attn_out, residual, o_proj, post_attention_layernorm, epsilon, down_proj, gate_proj, up_proj)
     return (hidden_state, kv_cache)
+
+@nnx.jit
+class ModelLayer(nnx.Module):
+
+    kv_cache = nnx.Param(jnp.zeros((2, 0, 8, 64), dtype=jax.dtypes.bfloat16))
+    num_kv_heads = nnx.Param(1)
+    num_attention_heads = nnx.Param(1)
+
+    def __init__(
+        self,
+        num_kv_heads: int,
+        num_attention_heads: int
+    ):
+        self.num_attention_heads.value = num_attention_heads
+        self.num_kv_heads.value = num_kv_heads
+        
+    
+    def clear_cache(self):
+        self.kv_cache.value = jnp.zeros((2, 0, 8, 64), dtype=jax.dtypes.bfloat16)
+    
+    def __call__(self,
+        hidden_state: jax.Array,
+        input_layernorm: jax.Array,
+        epsilon: jax.Array,
+        q_proj: jax.Array,
+        k_proj: jax.Array,
+        v_proj: jax.Array,
+        sin: jax.Array,
+        cos: jax.Array,
+        o_proj: jax.Array,
+        post_attention_layernorm: jax.Array,
+        down_proj: jax.Array,
+        gate_proj: jax.Array,
+        up_proj: jax.Array
+    ):
+        hidden_state = jax.lax.convert_element_type(hidden_state, jax.dtypes.bfloat16)
+        residual = hidden_state
+        hidden_state = rms_norm(hidden_state, input_layernorm, epsilon)
+        q = _linear(hidden_state, q_proj)
+        k = _linear(hidden_state, k_proj)
+        v = _linear(hidden_state, v_proj)
+        q = _split_query(q, self.num_attention_heads.value)
+        k = _split_kv(k, self.num_kv_heads.value)
+        v = _split_kv(v, self.num_kv_heads.value)
+        q,k = apply_rotary_embed(q, k, sin, cos)
+
+        ## Use cache
+        kv = lax.concatenate(
+            (k, v),
+            dimension=0
+        )
+        self.kv_cache.value = lax.concatenate((self.kv_cache.value, kv), dimension=1)
+        k = self.kv_cache.value[0, ...]
+        v = self.kv_cache.value[1, ...]
+        attn_out = jit_attention(q,k,v, is_causal=True, implementation="cudnn")
+        attn_out = _merge_heads(attn_out)
+        attn_out = _linear(attn_out, o_proj)
+        hidden_state = residual + attn_out
+        residual = hidden_state
+        hidden_state = rms_norm(hidden_state, post_attention_layernorm, epsilon)
+        hidden_state = mlp(hidden_state, up_proj, gate_proj, down_proj)
+        return hidden_state + residual
+    
+class JITLlamaModel():
+
+    layers: list[ModelLayer] = []
+    jit_layers: list[callable] = []
+    shard: Shard
+    config: LlamaConfig
+    eps: jax.Array = jnp.array(1e-5)
+    model_norm: jax.Array
+    hidden_state: jax.Array
+    input_layernorm: jax.Array
+    post_attention_layernorm: jax.Array
+    q_proj: jax.Array
+    k_proj: jax.Array
+    v_proj: jax.Array
+    o_proj: jax.Array
+    down_proj: jax.Array
+    gate_proj: jax.Array
+    up_proj: jax.Array
+
+    def __init__(self):
+        pass
+
+    def load_partial(self, shard: Shard, st_path: str, config: LlamaConfig):
+        config.num_key_value_heads
+        config.num_attention_heads
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.shard = shard
+        self.eps = jnp.array(config.rms_norm_eps)
+        
+        if shard.is_first_layer() or shard.is_last_layer():
+            self.embeddings = nnx.Embed(num_embeddings=config.vocab_size, features=config.hidden_size, rngs=nnx.Rngs(0))
+            self.lm_head = nnx.jit((self.embeddings.attend))
+            self.embeddings = nnx.jit(self.embeddings)
+
+        for _ in range(shard.start_layer, shard.end_layer + 1):
+            layer_module = ModelLayer(
+                num_attention_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads
+            )
+            self.layers.append(layer_module)
+        
+        for layer in self.layers:
+            self.jit_layers.append(nnx.jit(layer))
+
+        def concat_weights(st, key, start, end, dense: bool = True) -> jax.Array:
+            weights = convert_from_pt(st.get_tensor(f"model.layers.{start}.{key}.weight"), dense)
+            weights = lax.expand_dims(weights, [0])
+            for i in range(start +1 , end):
+                layer_weights = convert_from_pt(st.get_tensor(f"model.layers.{i}.{key}.weight"), dense)
+                layer_weights = lax.expand_dims(layer_weights, [0])
+                weights = lax.concatenate((weights, layer_weights), 0)
+            assert weights.shape[0] == end - start
+            return weights
+
+        ## Load weights
+        print("Loading model weight")
+        with safe_open(st_path, framework="pt") as st:
+            if self.embeddings is not None:
+                self.embeddings.embedding.value = convert_from_pt(st.get_tensor("model.embed_tokens.weight"))
+            self.input_layernorm = concat_weights(st, "input_layernorm", shard.start_layer, shard.end_layer + 1, dense=False)
+            self.down_proj = concat_weights(st, "mlp.down_proj", shard.start_layer, shard.end_layer + 1)
+            self.gate_proj = concat_weights(st, "mlp.gate_proj", shard.start_layer, shard.end_layer + 1)
+            self.up_proj = concat_weights(st, "mlp.up_proj", shard.start_layer, shard.end_layer + 1)
+            self.post_attention_layernorm = concat_weights(st, "post_attention_layernorm", shard.start_layer, shard.end_layer + 1, dense=False)
+            self.q_proj = concat_weights(st, "self_attn.q_proj", shard.start_layer, shard.end_layer + 1)
+            self.k_proj = concat_weights(st, "self_attn.k_proj", shard.start_layer, shard.end_layer + 1)
+            self.v_proj = concat_weights(st, "self_attn.v_proj", shard.start_layer, shard.end_layer + 1)
+            self.o_proj = concat_weights(st, "self_attn.o_proj", shard.start_layer, shard.end_layer + 1)
+            if shard.is_last_layer():
+                self.model_norm = convert_from_pt(st.get_tensor("model.norm.weight"))
+        print("Model weights loaded")
+
+    def __call__(self,
+        hidden_state: jax.Array,
+        sin: jax.Array,
+        cos: jax.Array
+    ):
+        # if hidden_state.shape[-1] == self.hidden_size and len(hidden_state.shape) == 3:
+        ## TODO: Maintain the cache state and also generate the rotary embeddings based on the req id
+        
+        hidden_state = self.embeddings(hidden_state)
+        start = time.time_ns()
+        for layer_idx in range(len(self.jit_layers)):
+            hidden_state = self.jit_layers[layer_idx](
+                hidden_state,
+                input_layernorm = self.input_layernorm[layer_idx, ...],
+                epsilon = self.eps,
+                q_proj = self.q_proj[layer_idx, ...],
+                k_proj = self.k_proj[layer_idx, ...],
+                v_proj = self.v_proj[layer_idx, ...],
+                sin = sin,
+                cos = cos,
+                o_proj = self.o_proj[layer_idx, ...],
+                post_attention_layernorm = self.post_attention_layernorm[layer_idx, ...],
+                down_proj = self.down_proj[layer_idx, ...],
+                gate_proj = self.gate_proj[layer_idx, ...],
+                up_proj = self.up_proj[layer_idx, ...]
+            )
+        if self.shard.is_last_layer():
+            hidden_state = rms_norm(hidden_state, self.model_norm, self.eps)
+        print(time.time_ns() - start)
+        return hidden_state
