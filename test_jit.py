@@ -1,6 +1,7 @@
 import exo.inference.jax_xla.models.llama as base_llama 
 import exo.inference.jax_xla.models.llama_jit as jit_llama
 from exo.inference.jax_xla.models.llama import LlamaEmbedding
+from exo.inference.shard import Shard
 from transformers import LlamaConfig
 from transformers.utils import SAFE_WEIGHTS_NAME, cached_file
 import jax
@@ -16,6 +17,7 @@ jit_attention = jax.jit(dot_product_attention, static_argnames=['bias', 'mask', 
 model_id = 'unsloth/Llama-3.2-1B-Instruct'
 config = LlamaConfig.from_pretrained(model_id)
 st_path = cached_file(model_id, SAFE_WEIGHTS_NAME)
+shard = Shard(start_layer=0, n_layers=16, end_layer=15, model_id=model_id)
 embeddings = LlamaEmbedding.from_safetensor(config, "model.embed_tokens", st_path, 'pt')
 token_ids = [[
         128000,
@@ -154,17 +156,17 @@ getattr(getattr(base_llama, "rotary_embedding"), "create_embed")(pos_ids)
 # test_attention()
 
 def calc_eps(a: jax.Array, b: jax.Array):
-    eps = (jax.lax.sqrt(jax.lax.square(b - a))).mean(axis=-1)
-    orig = jax.lax.abs(a).mean(axis=-1)
-    eps = eps/orig
-    print(f"EPS: Mean: {eps.mean()*100} Min: {eps.min()*100} Max: {eps.max()*100}")
+    print(f"STD : {jnp.std(a - b)}")
+    # eps = (jax.lax.sqrt(jax.lax.square(b - a))).mean(axis=-1)
+    # orig = jax.lax.abs(a).mean(axis=-1)
+    # eps = eps/orig
+    # print(f"EPS: Mean: {eps.mean()*100} Min: {eps.min()*100} Max: {eps.max()*100}")
 
 def test_layer_performance():
-    from exo.inference.jax_xla.models.llama_jit import test_layer
+    from exo.inference.jax_xla.models.llama_jit import test_layer, ModelLayer
     from exo.inference.jax_xla.models.llama import LlamaDecoderLayer, LlamaRotaryEmbedding
 
     llama = LlamaDecoderLayer.from_safetensor(config,"model.layers.0", st_path, "pt")
-    llama_jit = test_layer
 
     eps = jnp.array(config.rms_norm_eps, dtype=jax.dtypes.bfloat16)
     input_layernorm = llama.input_layernorm.weights
@@ -181,6 +183,10 @@ def test_layer_performance():
     cos = rot_embed.cos
     kv_cache= jnp.zeros((2, 0, 8, 64), dtype=jax.dtypes.bfloat16)
     cache_index =0
+    llama_jit = ModelLayer(
+        num_kv_heads=config.num_key_value_heads,
+        num_attention_heads=config.num_attention_heads
+    )
     jit_kwargs = {
         "hidden_state": hidden_state,
         "input_layernorm": input_layernorm.value,
@@ -195,11 +201,11 @@ def test_layer_performance():
         "sin": sin,
         "cos": cos,
         "epsilon": eps,
-        "num_kv_heads": config.num_key_value_heads,
-        "num_attention_heads": config.num_attention_heads,
+        # "num_kv_heads": config.num_key_value_heads,
+        # "num_attention_heads": config.num_attention_heads,
         # "is_causal": True,
         # "cache_index": cache_index,
-        "kv_cache": kv_cache
+        # "kv_cache": kv_cache
     }
 
     kwargs = {
@@ -234,20 +240,29 @@ def test_layer_performance():
     
     ## Call once for JIT compilation
     start = time.time_ns()
-    _, kv_cache = llama_jit(**jit_kwargs)
-    kv_cache.block_until_ready()
+    out_jit_first = llama_jit(**jit_kwargs)
+    out_jit_first.block_until_ready()
     print(f"JIT Base Time: {time.time_ns() - start}")
-    jit_kwargs['kv_cache'] = kv_cache
+    # jit_kwargs['kv_cache'] = kv_cache
     
     ## Profile Subsequent calls with JIT cache
     with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=False):
         start = time.time_ns()
-        out_jit, kv_cache = llama_jit(**jit_kwargs)
+        out_jit = llama_jit(**jit_kwargs)
         out_jit.block_until_ready()
         print(f"JIT Time: {time.time_ns() - start}")
+
+        # jit_kwargs['kv_cache'] = kv_cache
+
+        ## Test 2
+        start = time.time_ns()
+        out_jit = llama_jit(**jit_kwargs)
+        out_jit.block_until_ready()
+        print(f"JIT Time: {time.time_ns() - start}")
+
     
     ## Calculate EPS
-    calc_eps(out, out_jit[0])
+    calc_eps(out_next, out_jit)
 
 
     # print(f"TIMINGS: BASE {time_base}ns JIT {time_jit}ns")
@@ -262,4 +277,93 @@ def test_layer_performance():
 # with jax.disable_jit():
 #     test_layer()
 print("## WITH JIT")
-test_layer_performance()
+# test_layer_performance()
+
+
+
+def test_full_model():
+    from exo.inference.jax_xla.models.llama_jit import JITLlamaModel, prep_rotary_embed, generate_splitter
+    from exo.inference.jax_xla.models.utils.rope import compute_llama3_parameters
+
+    setattr(jit_llama, "_split_query", generate_splitter(config.num_attention_heads))
+    setattr(jit_llama, "_split_kv", generate_splitter(config.num_key_value_heads))
+
+    model = JITLlamaModel()
+    model.load_partial(shard, st_path, config)
+    rot_embed = prep_rotary_embed
+    jit_model = model
+    freq, attn_scaling = compute_llama3_parameters(config)
+    print("#"*10)
+    start = time.time_ns()
+    sin, cos = rot_embed(jnp.array(token_ids), freq, attn_scaling)
+    out_1 = jit_model(jnp.array(token_ids), sin, cos)
+    out_1.block_until_ready()
+    print(f"{out_1.shape}: {time.time_ns() - start}")
+    start = time.time_ns()
+    out_2 = jit_model(jnp.array(token_ids), sin, cos)
+    out_2.block_until_ready()
+    print(f"{out_2.shape}: {time.time_ns() - start}")
+    print("Wahta is ahskldjfp[pindfg]")
+
+# test_full_model()
+
+
+
+def aot_cache(config: LlamaConfig, max_tokens: int = 100):
+    cache = jnp.zeros((2, 0, config.num_key_value_heads, config.hidden_size // config.num_key_value_heads))
+    for i in range(max_tokens):
+        k = jnp.ones((1, 1, config.num_key_value_heads, config.hidden_size // config.num_key_value_heads))
+        v = jnp.ones((1, 1, config.num_key_value_heads, config.hidden_size // config.num_key_value_heads))
+        kv = jax.lax.concatenate(
+            (k, v),
+            dimension=0
+        )
+        cache = jax.lax.concatenate((cache, kv), dimension=1)
+        k = cache[0, ...]
+        v = cache[1, ...]
+
+def run_iters(model: callable, gen_embed: callable, freq: jax.Array, attn_scaling: jax.Array, start_tokens: jax.Array, next_token: jax.Array, times: int = 10):
+    base_start = time.time_ns()
+    sin, cos  = gen_embed(start_tokens, freq, attn_scaling)
+    base_out = model(start_tokens, sin, cos)
+    print(f"Base Time: {time.time_ns() - base_start} ns")
+    base_start = time.time_ns()
+    for i in range(times):
+        start = time.time_ns()
+        sin, cos = gen_embed(next_token, freq, attn_scaling)
+        next_run = model(next_token, sin, cos)
+        print(f"Run {i} time: {time.time_ns() - start}")
+    total_ns = time.time_ns() - base_start
+    per_token = total_ns / times
+    tokens_per_second = 1000000000 / per_token
+    print(f"Total time: {total_ns}, token_times: {per_token}, per second: {tokens_per_second}")
+
+
+def test_aot_cache_compilation():
+    from exo.inference.jax_xla.models.llama_jit import JITLlamaModel, prep_rotary_embed, generate_splitter
+    from exo.inference.jax_xla.models.utils.rope import compute_llama3_parameters
+
+    setattr(jit_llama, "_split_query", generate_splitter(config.num_attention_heads))
+    setattr(jit_llama, "_split_kv", generate_splitter(config.num_key_value_heads))
+
+    model = JITLlamaModel()
+    model.load_partial(shard, st_path, config)
+
+    initial_token_ids = jnp.array(token_ids)
+    next_tokens = jnp.array([[1303]])
+
+    freq, attn_scaling = compute_llama3_parameters(config)
+    run_iters(model, prep_rotary_embed, freq, attn_scaling, initial_token_ids, next_tokens)
+    # aot_cache(config)
+    model.reset_cache()
+    run_iters(model, prep_rotary_embed, freq, attn_scaling, initial_token_ids, next_tokens)
+
+
+test_aot_cache_compilation()
+
+
+# from exo.inference.jax_xla.models.llama_jit import get_splitter
+# test_func = get_splitter(8)
+# print(test_func)
+# print(hidden_state.shape)
+# test_func(hidden_state).shape
