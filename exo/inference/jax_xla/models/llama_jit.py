@@ -897,117 +897,25 @@ def model_test_post_cache(
     hidden_state = rms_norm(hidden_state, post_attention_layernorm, epsilon)
     hidden_state = mlp(hidden_state, up_proj, gate_proj, down_proj)
     return hidden_state + residual
-    
-class JITLlamaModel():
 
-    layers: list[ModelLayer] = []
-    jit_layers: list[callable] = []
+
+@nnx.jit
+class JITLlamaModel(nnx.Module):
+
+    num_layers: int
     kv_cache: nnx.Param = nnx.Param([])
-    shard: Shard
-    config: LlamaConfig
-    eps: jax.Array = jnp.array(1e-5)
-    model_norm: jax.Array
-    hidden_state: jax.Array
-    input_layernorm: jax.Array
-    post_attention_layernorm: jax.Array
-    q_proj: jax.Array
-    k_proj: jax.Array
-    v_proj: jax.Array
-    o_proj: jax.Array
-    down_proj: jax.Array
-    gate_proj: jax.Array
-    up_proj: jax.Array
-
-    def __init__(self):
-        pass
-
-    def load_partial(self, shard: Shard, st_path: str, config: LlamaConfig):
-        config.num_key_value_heads
-        config.num_attention_heads
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.shard = shard
-        self.eps = jnp.array(config.rms_norm_eps)
-        self.num_layers = shard.get_layer_count()
-        
-        if shard.is_first_layer() or shard.is_last_layer():
-            self.embeddings = nnx.Embed(num_embeddings=config.vocab_size, features=config.hidden_size, rngs=nnx.Rngs(0))
-            self.lm_head = nnx.jit((self.embeddings.attend))
-            self.embeddings = nnx.jit(self.embeddings)
-
-        # for _ in range(shard.start_layer, shard.end_layer + 1):
-        #     layer_module = ModelLayer()
-        #     self.layers.append(layer_module)
-        
-        # for layer in self.layers:
-        #     self.jit_layers.append(nnx.jit(layer))
-        
-        self.kv_cache.value = [jnp.zeros((2, 0, 8, 64), dtype=jax.dtypes.bfloat16) for _ in range(shard.start_layer, shard.end_layer + 1)]
-
-        def concat_weights(st, key, start, end, dense: bool = True) -> jax.Array:
-            return jax.lax.concatenate([lax.expand_dims(convert_from_pt(st.get_tensor(f"model.layers.{i}.{key}.weight"), dense), [0]) for i in range(start, end)], 0)
-
-            weights = convert_from_pt(st.get_tensor(f"model.layers.{start}.{key}.weight"), dense)
-            weights = lax.expand_dims(weights, [0])
-            for i in range(start +1 , end):
-                layer_weights = convert_from_pt(st.get_tensor(f"model.layers.{i}.{key}.weight"), dense)
-                layer_weights = lax.expand_dims(layer_weights, [0])
-                weights = lax.concatenate((weights, layer_weights), 0)
-            assert weights.shape[0] == end - start
-            return weights
-
-        ## Load weights
-        print("Loading model weight")
-        with safe_open(st_path, framework="pt") as st:
-            if self.embeddings is not None:
-                self.embeddings.embedding.value = convert_from_pt(st.get_tensor("model.embed_tokens.weight"))
-            self.input_layernorm = concat_weights(st, "input_layernorm", shard.start_layer, shard.end_layer + 1, dense=False)
-            self.down_proj = concat_weights(st, "mlp.down_proj", shard.start_layer, shard.end_layer + 1)
-            self.gate_proj = concat_weights(st, "mlp.gate_proj", shard.start_layer, shard.end_layer + 1)
-            self.up_proj = concat_weights(st, "mlp.up_proj", shard.start_layer, shard.end_layer + 1)
-            self.post_attention_layernorm = concat_weights(st, "post_attention_layernorm", shard.start_layer, shard.end_layer + 1, dense=False)
-            self.q_proj = concat_weights(st, "self_attn.q_proj", shard.start_layer, shard.end_layer + 1)
-            self.k_proj = concat_weights(st, "self_attn.k_proj", shard.start_layer, shard.end_layer + 1)
-            self.v_proj = concat_weights(st, "self_attn.v_proj", shard.start_layer, shard.end_layer + 1)
-            self.o_proj = concat_weights(st, "self_attn.o_proj", shard.start_layer, shard.end_layer + 1)
-            if shard.is_last_layer():
-                self.model_norm = convert_from_pt(st.get_tensor("model.norm.weight"))
-        print("Model weights loaded")
-
-    def reset_cache(self):
-        self.kv_cache.value = [jnp.zeros((2, 0, 8, 64), dtype=jax.dtypes.bfloat16) for _ in range(self.num_layers)]
-
-    def jit_call(
-            self,
-            hidden_state: jax.Array,
-            input_layernorm: jax.Array,
-            epsilon: jax.Array,
-            q_proj: jax.Array,
-            k_proj: jax.Array,
-            v_proj: jax.Array,
-            sin: jax.Array,
-            cos: jax.Array,
-            o_proj: jax.Array,
-            post_attention_layernorm: jax.Array,
-            down_proj: jax.Array,
-            gate_proj: jax.Array,
-            up_proj: jax.Array
-    ):
-        pass
-
-    def use_kv_cache(self, k, v, layer_idx):
-        updating_cache = self.kv_cache.value
-        kv = lax.concatenate(
-            (k, v),
-            dimension=0
-        )
-        layer_cache = updating_cache[layer_idx]
-        layer_cache = lax.concatenate((layer_cache, kv), dimension=1)
-        k = layer_cache[0, ...]
-        v = layer_cache[1, ...]
-        updating_cache[layer_idx] = layer_cache
-        self.kv_cache.value = updating_cache
-        return k,v
+    eps: nnx.Param = nnx.Param(1e-5)
+    model_norm: nnx.Param = nnx.Param(0)
+    hidden_state: nnx.Param = nnx.Param(0)
+    input_layernorm: nnx.Param = nnx.Param(0)
+    post_attention_layernorm: nnx.Param = nnx.Param(0)
+    q_proj: nnx.Param = nnx.Param(0)
+    k_proj: nnx.Param = nnx.Param(0)
+    v_proj: nnx.Param = nnx.Param(0)
+    o_proj: nnx.Param = nnx.Param(0)
+    down_proj: nnx.Param = nnx.Param(0)
+    gate_proj: nnx.Param = nnx.Param(0)
+    up_proj: nnx.Param = nnx.Param(0)
 
     def __call__(self,
         hidden_state: jax.Array,
@@ -1021,16 +929,26 @@ class JITLlamaModel():
         hidden_state = self.embeddings(hidden_state)
         updating_cache = self.kv_cache.value
         for layer_idx in range(self.num_layers):
-            residual, q, k, v = model_test_pre_cache(
-                hidden_state,
-                input_layernorm = self.input_layernorm[layer_idx, ...],
-                epsilon = self.eps,
-                q_proj = self.q_proj[layer_idx, ...],
-                k_proj = self.k_proj[layer_idx, ...],
-                v_proj = self.v_proj[layer_idx, ...],
-                sin = sin,
-                cos = cos
-            )
+            # residual, q, k, v = model_test_pre_cache(
+            #     hidden_state,
+            #     input_layernorm = self.input_layernorm.value[layer_idx, ...],
+            #     epsilon = self.eps,
+            #     q_proj = self.q_proj.value[layer_idx, ...],
+            #     k_proj = self.k_proj.value[layer_idx, ...],
+            #     v_proj = self.v_proj.value[layer_idx, ...],
+            #     sin = sin,
+            #     cos = cos
+            # )
+            hidden_state = jax.lax.convert_element_type(hidden_state, jax.dtypes.bfloat16)
+            residual = hidden_state
+            hidden_state = rms_norm(hidden_state, self.input_layernorm.value[layer_idx, ...], self.eps.value)
+            q = _linear(hidden_state, self.q_proj.value[layer_idx, ...])
+            k = _linear(hidden_state, self.k_proj.value[layer_idx, ...])
+            v = _linear(hidden_state, self.v_proj.value[layer_idx, ...])
+            q = _split_query(q)
+            k = _split_kv(k)
+            v = _split_kv(v)
+            q,k = apply_rotary_embed(q, k, sin, cos)
 
             kv = lax.concatenate(
                 (k, v),
@@ -1044,34 +962,71 @@ class JITLlamaModel():
             # k,v = self.use_kv_cache(k, v, layer_idx)
             
             attn_out = dot_product_attention(q,k,v, is_causal=True, implementation="cudnn")
-            hidden_state = model_test_post_cache(
-                residual=residual,
-                attn_out=attn_out,
-                epsilon=self.eps,
-                o_proj = self.o_proj[layer_idx, ...],
-                post_attention_layernorm = self.post_attention_layernorm[layer_idx, ...],
-                down_proj = self.down_proj[layer_idx, ...],
-                gate_proj = self.gate_proj[layer_idx, ...],
-                up_proj = self.up_proj[layer_idx, ...]
-            )
-
-            # hidden_state = self.jit_layers[layer_idx](
-            #     hidden_state,
-            #     input_layernorm = self.input_layernorm[layer_idx, ...],
-            #     epsilon = self.eps,
-            #     q_proj = self.q_proj[layer_idx, ...],
-            #     k_proj = self.k_proj[layer_idx, ...],
-            #     v_proj = self.v_proj[layer_idx, ...],
-            #     sin = sin,
-            #     cos = cos,
-            #     o_proj = self.o_proj[layer_idx, ...],
-            #     post_attention_layernorm = self.post_attention_layernorm[layer_idx, ...],
-            #     down_proj = self.down_proj[layer_idx, ...],
-            #     gate_proj = self.gate_proj[layer_idx, ...],
-            #     up_proj = self.up_proj[layer_idx, ...]
+            attn_out = _merge_heads(attn_out)
+            attn_out = _linear(attn_out, self.o_proj.value[layer_idx, ...])
+            hidden_state = residual + attn_out
+            residual = hidden_state
+            hidden_state = rms_norm(hidden_state, self.post_attention_layernorm.value[layer_idx, ...], self.eps.value)
+            hidden_state = mlp(hidden_state, self.up_proj.value[layer_idx, ...], self.gate_proj.value[layer_idx, ...], self.down_proj.value[layer_idx, ...])
+            hidden_state = hidden_state + residual
+            # hidden_state = model_test_post_cache(
+            #     residual=residual,
+            #     attn_out=attn_out,
+            #     epsilon=self.eps,
+            #     o_proj = self.o_proj.value[layer_idx, ...],
+            #     post_attention_layernorm = self.post_attention_layernorm.value[layer_idx, ...],
+            #     down_proj = self.down_proj.value[layer_idx, ...],
+            #     gate_proj = self.gate_proj.value[layer_idx, ...],
+            #     up_proj = self.up_proj.value[layer_idx, ...]
             # )
-        if self.shard.is_last_layer():
-            hidden_state = rms_norm(hidden_state, self.model_norm, self.eps)
-        print(self.kv_cache.value)
+        # if self.shard.is_last_layer():
+        #     hidden_state = rms_norm(hidden_state, self.model_norm.value, self.eps)
+        # print(self.kv_cache.shape)
         self.kv_cache.value = updating_cache
         return hidden_state
+
+def load_partial(model: JITLlamaModel, shard: Shard, st_path: str, config: LlamaConfig):
+    config.num_key_value_heads
+    config.num_attention_heads
+    config = config
+    shard = shard
+    model.eps.value = config.rms_norm_eps
+    model.num_layers = shard.get_layer_count()
+    
+    if shard.is_first_layer() or shard.is_last_layer():
+        embeddings = nnx.Embed(num_embeddings=config.vocab_size, features=config.hidden_size, rngs=nnx.Rngs(0))
+        model.lm_head = nnx.jit((embeddings.attend))
+        model.embeddings = nnx.jit(embeddings)
+
+    # for _ in range(shard.start_layer, shard.end_layer + 1):
+    #     layer_module = ModelLayer()
+    #     model.layers.append(layer_module)
+    
+    # for layer in model.layers:
+    #     model.jit_layers.append(nnx.jit(layer))
+    
+    model.kv_cache.value = [jnp.zeros((2, 0, 8, 64), dtype=jax.dtypes.bfloat16) for _ in range(shard.start_layer, shard.end_layer + 1)]
+
+    def concat_weights(st, key, start, end, dense: bool = True) -> jax.Array:
+        return jax.lax.concatenate([lax.expand_dims(convert_from_pt(st.get_tensor(f"model.layers.{i}.{key}.weight"), dense), [0]) for i in range(start, end)], 0)
+
+    ## Load weights
+    print("Loading model weight")
+    with safe_open(st_path, framework="pt") as st:
+        if model.embeddings is not None:
+            model.embeddings.embedding.value = convert_from_pt(st.get_tensor("model.embed_tokens.weight"))
+        model.input_layernorm.value = concat_weights(st, "input_layernorm", shard.start_layer, shard.end_layer + 1, dense=False)
+        model.down_proj.value = concat_weights(st, "mlp.down_proj", shard.start_layer, shard.end_layer + 1)
+        model.gate_proj.value = concat_weights(st, "mlp.gate_proj", shard.start_layer, shard.end_layer + 1)
+        model.up_proj.value = concat_weights(st, "mlp.up_proj", shard.start_layer, shard.end_layer + 1)
+        model.post_attention_layernorm.value = concat_weights(st, "post_attention_layernorm", shard.start_layer, shard.end_layer + 1, dense=False)
+        model.q_proj.value = concat_weights(st, "self_attn.q_proj", shard.start_layer, shard.end_layer + 1)
+        model.k_proj.value = concat_weights(st, "self_attn.k_proj", shard.start_layer, shard.end_layer + 1)
+        model.v_proj.value = concat_weights(st, "self_attn.v_proj", shard.start_layer, shard.end_layer + 1)
+        model.o_proj.value = concat_weights(st, "self_attn.o_proj", shard.start_layer, shard.end_layer + 1)
+        if shard.is_last_layer():
+            model.model_norm.value = convert_from_pt(st.get_tensor("model.norm.weight"))
+    print("Model weights loaded")
+
+def reset_cache(model: JITLlamaModel ):
+    model.kv_cache.value = [jnp.zeros((2, 0, 8, 64), dtype=jax.dtypes.bfloat16) for _ in range(model.num_layers)]

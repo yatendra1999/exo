@@ -9,6 +9,7 @@ from jax import numpy as jnp
 from jax.nn import dot_product_attention
 from flax import nnx
 from timeit import timeit
+from threading import Thread
 import time
 
 
@@ -329,10 +330,8 @@ def run_iters(model: callable, gen_embed: callable, freq: jax.Array, attn_scalin
     print(f"Base Time: {time.time_ns() - base_start} ns")
     base_start = time.time_ns()
     for i in range(times):
-        start = time.time_ns()
         sin, cos = gen_embed(next_token, freq, attn_scaling)
         next_run = model(next_token, sin, cos)
-        print(f"Run {i} time: {time.time_ns() - start}")
     total_ns = time.time_ns() - base_start
     per_token = total_ns / times
     tokens_per_second = 1000000000 / per_token
@@ -347,7 +346,8 @@ def test_aot_cache_compilation():
     setattr(jit_llama, "_split_kv", generate_splitter(config.num_key_value_heads))
 
     model = JITLlamaModel()
-    model.load_partial(shard, st_path, config)
+    jit_llama.load_partial(model, shard, st_path, config)
+    # model = nnx.jit(model)
 
     initial_token_ids = jnp.array(token_ids)
     next_tokens = jnp.array([[1303]])
@@ -355,9 +355,9 @@ def test_aot_cache_compilation():
     freq, attn_scaling = compute_llama3_parameters(config)
     run_iters(model, prep_rotary_embed, freq, attn_scaling, initial_token_ids, next_tokens)
     # aot_cache(config)
-    model.reset_cache()
+    jit_llama.reset_cache(model)
+    # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     run_iters(model, prep_rotary_embed, freq, attn_scaling, initial_token_ids, next_tokens)
-
 
 test_aot_cache_compilation()
 
